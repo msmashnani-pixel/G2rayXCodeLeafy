@@ -786,14 +786,14 @@ self_heal_once() {
 _background_tasks() {
     set +e
     local tick=0 health_tick=0 export_tick=0
-    date +%s > "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true
+    write_background_supervisor_heartbeat
     while true; do
         sleep 60
         if ! background_supervisor_token_current; then
             log_event WARN "background supervisor_superseded pid=$$"
             exit 0
         fi
-        date +%s > "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true
+        write_background_supervisor_heartbeat
         rotate_log_file "$LOG_FILE"
         rotate_log_file "$LOG_DIR/xray-error.log"
         if [[ "$PORT_DOMAIN" == unknown-codespace* ]]; then
@@ -844,7 +844,7 @@ start_background_tasks() {
     fi
     if [[ -f "$BG_TASKS_PID" ]]; then
         local p; p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
-        if bg_tasks_running "$p"; then
+        if bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p"; then
             if background_supervisor_version_matches; then
                 release_bg_tasks_lock
                 return 0
@@ -889,10 +889,10 @@ background_supervisor_version_matches() {
 stop_background_tasks() {
     local p
     p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
-    if bg_tasks_running "$p" || legacy_bg_tasks_running "$p"; then
+    if bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p" || legacy_bg_tasks_running "$p"; then
         kill "$p" >/dev/null 2>&1 || true
         sleep 1
-        (bg_tasks_running "$p" || legacy_bg_tasks_running "$p") && kill -9 "$p" >/dev/null 2>&1 || true
+        (bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p" || legacy_bg_tasks_running "$p") && kill -9 "$p" >/dev/null 2>&1 || true
     fi
     rm -f "$BG_TASKS_PID" "$BG_TASKS_VERSION_FILE" "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true
 }
@@ -925,19 +925,49 @@ background_supervisor_token_current() {
     [[ -n "${G2RAY_BG_TASK_TOKEN:-}" && -n "$expected" && "$G2RAY_BG_TASK_TOKEN" == "$expected" ]]
 }
 
+write_background_supervisor_heartbeat() {
+    local now
+    now=$(date +%s)
+    printf '%s %s %s\n' "$$" "${G2RAY_BG_TASK_TOKEN:-}" "$now" > "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true
+}
+
+background_supervisor_heartbeat_timestamp() {
+    local raw hb_pid hb_token hb_ts
+    raw=$(cat "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true)
+    read -r hb_pid hb_token hb_ts _ <<< "$raw"
+    if [[ "$hb_ts" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$hb_ts"
+    elif [[ "$hb_pid" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$hb_pid"
+    else
+        return 1
+    fi
+}
+
 background_supervisor_recent_heartbeat() {
     local hb now max_age="${1:-180}"
-    hb=$(cat "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true)
+    hb=$(background_supervisor_heartbeat_timestamp 2>/dev/null || true)
     [[ "$hb" =~ ^[0-9]+$ ]] || return 1
     now=$(date +%s)
     (( now >= hb && now - hb <= max_age ))
 }
 
+background_supervisor_heartbeat_matches() {
+    local p="${1:-}" raw hb_pid hb_token hb_ts expected
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    expected=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
+    [[ -n "$expected" ]] || return 1
+    raw=$(cat "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true)
+    read -r hb_pid hb_token hb_ts _ <<< "$raw"
+    [[ "$hb_pid" == "$p" && "$hb_token" == "$expected" && "$hb_ts" =~ ^[0-9]+$ ]] || return 1
+    background_supervisor_recent_heartbeat
+}
+
 background_supervisor_heartbeat_running() {
     local p="${1:-}"
     [[ "$p" =~ ^[0-9]+$ ]] || return 1
-    bg_tasks_running "$p" || legacy_bg_tasks_running "$p" || return 1
-    background_supervisor_recent_heartbeat
+    background_supervisor_heartbeat_matches "$p" || return 1
 }
 
 background_supervisor_status() {
@@ -1121,8 +1151,30 @@ generate_domain_link() {
     generate_link_for_address "$PORT_DOMAIN"
 }
 
+usable_fallback_ips() {
+    local ip ip_probe ip_ms count=0 max_links="$MAX_FALLBACK_LINKS" candidates usable
+    [[ "$max_links" =~ ^[0-9]+$ && "$max_links" -gt 0 ]] || max_links=3
+    candidates=$(resolve_domain_ips "$PORT_DOMAIN" || true)
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] || continue
+        read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
+        if xhttp_status_usable "$ip_probe"; then
+            printf '%s\n' "$ip"
+            usable=true
+            count=$((count + 1))
+        else
+            log_event WARN "fallback_route_unusable ip=${ip} xhttp_probe=${ip_probe:-0} xhttp_probe_ms=${ip_ms:-0}"
+        fi
+        (( count >= max_links )) && return 0
+    done <<< "$candidates"
+    if [[ "${usable:-false}" != true ]]; then
+        log_event WARN "fallback_route_filter no-usable-probes action=export-candidates"
+        printf '%s\n' "$candidates" | awk 'NF' | head -n "$max_links"
+    fi
+}
+
 generate_ip_link() {
-    local address; address=$(resolve_domain_ips "$PORT_DOMAIN" | head -1 || true)
+    local address; address=$(usable_fallback_ips | head -1 || true)
     [[ -n "$address" ]] || return 1
     generate_link_for_address "$address" "-ip1"
 }
@@ -1137,7 +1189,7 @@ generate_ip_links() {
         generate_link_for_address "$address" "-ip${index}"
         printed=true
         index=$(( index + 1 ))
-    done < <(resolve_domain_ips "$PORT_DOMAIN")
+    done < <(usable_fallback_ips)
 }
 
 generate_ordered_links() {

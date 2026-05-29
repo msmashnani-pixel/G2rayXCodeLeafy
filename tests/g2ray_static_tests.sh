@@ -484,12 +484,32 @@ test_diagnostics_show_self_heal_state() {
 test_background_supervisor_ownership_is_strict() {
     grep_fixed 'background_supervisor_token_current()' "$SCRIPT" \
         || fail 'background supervisor loop does not verify its token remains current'
+    grep_fixed 'write_background_supervisor_heartbeat()' "$SCRIPT" \
+        || fail 'background supervisor heartbeat does not carry ownership data'
+    grep_fixed 'background_supervisor_heartbeat_matches()' "$SCRIPT" \
+        || fail 'fresh heartbeat cannot prove supervisor ownership when proc env is unavailable'
+    grep_fixed 'printf '\''%s %s %s\n'\'' "$$" "${G2RAY_BG_TASK_TOKEN:-}" "$now"' "$SCRIPT" \
+        || fail 'heartbeat does not persist pid token and timestamp together'
     grep_fixed 'supervisor_superseded' "$SCRIPT" \
         || fail 'superseded background supervisors do not self-exit'
     if grep_fixed 'legacy_bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p"' "$SCRIPT"; then
         fail 'supervisor lifecycle still trusts legacy/heartbeat ownership for reuse or kill decisions'
     fi
     pass 'background supervisor ownership is strict'
+}
+
+test_exports_filter_unusable_fallback_routes() {
+    grep_fixed 'usable_fallback_ips()' "$SCRIPT" \
+        || fail 'fallback exports cannot filter unusable route IPs'
+    grep_fixed 'xhttp_probe_metrics external "$ip"' "$SCRIPT" \
+        || fail 'fallback export filtering does not probe each IP route'
+    grep_fixed 'xhttp_status_usable "$ip_probe"' "$SCRIPT" \
+        || fail 'fallback export filtering does not require usable XHTTP status'
+    grep_fixed 'done < <(usable_fallback_ips)' "$SCRIPT" \
+        || fail 'generate_ip_links still exports raw fallback candidates'
+    grep_fixed 'address=$(usable_fallback_ips | head -1 || true)' "$SCRIPT" \
+        || fail 'recommended IP link does not prefer a usable fallback route'
+    pass 'fallback exports filter unusable route IPs'
 }
 
 test_runtime_ready_rejects_started_but_unusable_route() {
@@ -704,6 +724,7 @@ test_probe_and_gh_commands_are_bounded
 test_diagnostics_show_latency_and_supervisor_state
 test_diagnostics_show_self_heal_state
 test_background_supervisor_ownership_is_strict
+test_exports_filter_unusable_fallback_routes
 test_runtime_ready_rejects_started_but_unusable_route
 test_runtime_files_are_private_and_tempfiles_are_unique
 test_logs_are_bounded_and_quota_is_cycle_aware
