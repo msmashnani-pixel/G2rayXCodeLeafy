@@ -85,6 +85,8 @@ Donate your generated config directly from the CLI to share access with the comm
 4. **Launch Panel**  
    → The G2ray CLI panel auto-starts in the terminal!
 
+If browser Codespaces stays on a loading screen for a long time, open the same Codespace in **VS Code Desktop** from the GitHub Codespaces page. The panel runs the same way there and is often faster on slow browser sessions.
+
 <details>
 <summary><kbd>⚙️</kbd> Environment Configuration</summary>
 
@@ -104,6 +106,8 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_QUOTA_SECONDS` **(Optional)** — Local monthly quota estimate in seconds. Default: `216000` (60 wall-clock hours on a 2-core Codespace).
 
 Generated links include `allowInsecure=1` for compatibility with IP fallback links that still route through the Codespaces SNI/Host. This is a compatibility tradeoff: clients that honor the flag may relax TLS certificate verification.
+
+If a phone QR scanner struggles with the terminal QR code, import the copy-ready link from the panel output or `configs-to-copy-for-mobile.txt`. Terminal zoom, font rendering, and dark themes can make dense QR codes harder to scan.
 
 </details>
 
@@ -158,6 +162,22 @@ If you want a phone/browser/curl-accessible manual wake button, this repo includ
 The panel can guide this from **Option 15: Recovery / Waker Setup**. It detects the current Codespace name, generates a wake secret, reminds you to set Default idle timeout to 240 minutes, and saves only non-sensitive metadata such as the Worker URL and wake-secret fingerprint.
 
 Do not paste the GitHub token into G2ray. Create the token in GitHub, save it privately, and enter it directly in Cloudflare as the `GITHUB_TOKEN` secret. The wake secret is shown once by the panel; save it privately and enter it directly in Cloudflare as the `WAKE_SECRET` secret.
+
+Classic token path:
+
+1. Open <https://github.com/settings/tokens/new?scopes=codespace>.
+2. Give it a clear name, such as `G2ray Codespace Waker`.
+3. Choose an expiration you can remember.
+4. Keep only the `codespace` scope selected.
+5. Generate the token and copy it once.
+
+Cloudflare dashboard binding types:
+
+- `CODESPACE_NAME`: **Plaintext** variable.
+- `GITHUB_TOKEN`: **Secret** variable.
+- `WAKE_SECRET`: **Secret** variable.
+
+The Worker URL can be entered with or without `https://`, and with or without `/wake`; the panel normalizes it to `https://YOUR_WORKER.workers.dev/wake`.
 
 Quick setup:
 

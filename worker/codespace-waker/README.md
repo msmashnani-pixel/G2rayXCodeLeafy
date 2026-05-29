@@ -6,7 +6,15 @@ It does not keep the Codespace alive forever and it cannot bypass quota, billing
 
 ## 1. Create a GitHub Token
 
-Use one of these:
+Recommended path:
+
+1. Open <https://github.com/settings/tokens/new?scopes=codespace>.
+2. Give it a clear name, such as `G2ray Codespace Waker`.
+3. Choose an expiration you can remember.
+4. Keep only the `codespace` scope selected.
+5. Generate the token and copy it once.
+
+Token types:
 
 - Classic personal access token with the `codespace` scope.
 - Fine-grained token that can access the repo and has Codespaces lifecycle/admin write permission, if that option is available in your account.
@@ -45,6 +53,8 @@ Example:
 CODESPACE_NAME = "animated-spork-wvr97qjxqjqwcg6xq"
 ```
 
+If you use the Cloudflare dashboard instead of Wrangler, add `CODESPACE_NAME` as a **Plaintext** variable.
+
 ## 3. Add Secrets
 
 Create a long random wake secret. Examples:
@@ -69,6 +79,8 @@ npx wrangler secret put WAKE_SECRET
 Paste the GitHub token for `GITHUB_TOKEN`.
 Paste your random wake secret for `WAKE_SECRET`.
 
+In the Cloudflare dashboard, add both `GITHUB_TOKEN` and `WAKE_SECRET` as **Secret** variables, not plaintext variables.
+
 ## 4. Deploy
 
 ```bash
@@ -80,6 +92,8 @@ Wrangler prints the Worker URL, for example:
 ```text
 https://g2ray-codespace-waker.YOUR_SUBDOMAIN.workers.dev
 ```
+
+The panel accepts the Worker URL with or without `https://`, and with or without `/wake`. It stores the normalized `/wake` URL.
 
 ## 5. Start The Codespace Manually
 

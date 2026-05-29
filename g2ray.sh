@@ -500,16 +500,19 @@ setup_cloudflare_waker() {
     echo -e "  First, set GitHub Codespaces ${WHITE}Default idle timeout${NC} to ${WHITE}240 minutes${NC}:"
     echo -e "  GitHub -> Settings -> Codespaces -> Default idle timeout -> 240 minutes.\n"
     echo -e "  ${WHITE}${B}Step 1 - Create a GitHub token${NC}"
-    echo -e "  Create a GitHub token that can start this Codespace."
-    echo -e "  Classic token: select the ${WHITE}codespace${NC} scope."
+    echo -e "  Recommended classic token path:"
+    echo -e "  ${WHITE}https://github.com/settings/tokens/new?scopes=codespace${NC}"
+    echo -e "  Or open GitHub -> Settings -> Developer settings -> Personal access tokens -> Tokens (classic)."
+    echo -e "  Generate a new classic token and select only the ${WHITE}codespace${NC} scope."
     echo -e "  Do not paste the GitHub token into G2ray."
     echo -e "  Save it privately, then put it directly into Cloudflare as secret ${WHITE}GITHUB_TOKEN${NC}.\n"
     echo -e "  ${WHITE}${B}Step 2 - Create a Worker${NC}"
     echo -e "  In Cloudflare, create a Hello World Worker, open its editor, and replace the code with:"
     echo -e "  ${WHITE}${BASE_DIR}/worker/codespace-waker/src/index.js${NC}\n"
-    echo -e "  Set Worker variable ${WHITE}CODESPACE_NAME${NC} to:"
+    echo -e "  In Cloudflare -> Worker -> Settings -> Variables and Secrets, add:"
+    echo -e "  ${WHITE}CODESPACE_NAME${NC} as a ${WHITE}Plaintext${NC} variable with this value:"
     echo -e "  ${GREEN}${CODESPACE_NAME}${NC}\n"
-    echo -e "  Set Worker secrets:"
+    echo -e "  Add these as ${WHITE}Secret${NC} variables:"
     echo -e "  ${WHITE}GITHUB_TOKEN${NC} -> the GitHub token you created"
     echo -e "  ${WHITE}WAKE_SECRET${NC}  -> the wake secret below\n"
     echo -e "  The wake secret is shown once. Save it now and paste it into Cloudflare:"
@@ -519,11 +522,12 @@ setup_cloudflare_waker() {
     read -r ready || { touch "$WAKER_PROMPT_FILE" 2>/dev/null || true; return 0; }
     [[ "$ready" =~ ^[Yy]$ ]] || { echo -e "  ${DIM}Setup paused. Open option 15 when ready.${NC}"; sleep 2; return 0; }
 
-    echo -ne "  ${GREEN}Worker wake URL:${NC} "
+    echo -ne "  ${GREEN}Worker wake URL (https optional, /wake optional):${NC} "
     read -r worker_url || { echo -e "  ${RED}Missing Worker URL.${NC}"; sleep 2; return 1; }
     worker_url=$(normalize_waker_url "$worker_url" 2>/dev/null || true)
     if [[ -z "$worker_url" ]]; then
         echo -e "  ${RED}Invalid Worker URL.${NC}"
+        echo -e "  ${DIM}Example: https://your-worker.your-subdomain.workers.dev/wake${NC}"
         sleep 2
         return 1
     fi
@@ -598,7 +602,7 @@ maybe_prompt_waker_setup() {
 render_config_qr() {
     local link="$1"
     if command -v qrencode >/dev/null 2>&1; then
-        qrencode -m 0 -t UTF8 "$link" | while IFS= read -r line; do
+        qrencode -m 1 -t UTF8 "$link" | while IFS= read -r line; do
             printf '  %s\n' "$line"
         done
     else
@@ -1863,8 +1867,10 @@ while true; do
 
     if tmux has-session -t g2ray_keepalive 2>/dev/null; then
         _KA="${GREEN}Enabled${NC}"
+        _KA_LABEL="${GREEN}currently Enabled${NC}"
     else
         _KA="${DIM}Disabled${NC}"
+        _KA_LABEL="${DIM}currently Disabled${NC}"
     fi
 
     echo -e "  ${WHITE}${B}Engine Status  :${NC} $(echo -e "$_STATUS")"
@@ -1875,7 +1881,7 @@ while true; do
     echo -e "   ${RED}3)${NC} Start Engine                ${RED}6)${NC} Force Reconnect"
     echo ""
     echo -e "  ${WHITE}${B}● SYSTEM CONFIGURATION${NC}"
-    echo -e "   ${RED}7)${NC} Toggle Anti-Sleep Mode"
+    echo -e "   ${RED}7)${NC} Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))"
     echo -e "   ${RED}8)${NC} Donate Config"
     echo ""
     echo -e "  ${WHITE}${B}● ANALYTICS & TOOLS${NC}"
@@ -1959,6 +1965,8 @@ while true; do
                 _INDEX=$((_INDEX + 1))
             done
             echo -e "  ${DIM}IP links keep ${PORT_DOMAIN} as SNI/Host for Codespaces routing.${NC}\n"
+            echo -e "  ${DIM}If phone QR scanning fails, import the copy-ready link or${NC}"
+            echo -e "  ${DIM}${MOBILE_CONFIG_FILE} instead. Terminal zoom/theme can make QR scanning unreliable.${NC}\n"
             _COUNTRY=$(curl -s --max-time 3 https://ipinfo.io/country </dev/null 2>/dev/null || echo "Unknown")
             if [[ "$_COUNTRY" != "DE" && "$_COUNTRY" != "NL" && "$_COUNTRY" != "Unknown" ]]; then
                 echo -e "  ${RED}WARNING: Codespace is NOT in Germany (${_COUNTRY})!${NC}"

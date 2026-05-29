@@ -256,8 +256,10 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'config display does not default to recommended-only QR mode'
     grep_fixed '[[ "$_QR_MODE" == "all" || ( "$_QR_MODE" != "none" && $_INDEX -eq 1 ) ]]' "$SCRIPT" \
         || fail 'config display does not limit default QR rendering to the first recommended config'
-    grep_fixed 'qrencode -m 0 -t UTF8 "$link"' "$SCRIPT" \
-        || fail 'QR renderer does not use compact terminal QR output'
+    grep_fixed 'qrencode -m 1 -t UTF8 "$link"' "$SCRIPT" \
+        || fail 'QR renderer does not include a compact quiet-zone margin for phone scanners'
+    grep_fixed 'Terminal zoom/theme can make QR scanning unreliable' "$SCRIPT" \
+        || fail 'config view does not explain the copy-link fallback when QR scanning fails'
     grep_fixed 'printf '\''%s\n'\'' "$link"' "$SCRIPT" \
         || fail 'config links are not printed as raw copy-ready lines'
     grep_fixed 'write_config_exports_from_links()' "$SCRIPT" \
@@ -612,6 +614,14 @@ test_panel_guides_cloudflare_waker_setup() {
         || fail 'recovery submenu does not route to metadata reset'
     grep_fixed 'Do not paste the GitHub token into G2ray' "$SCRIPT" \
         || fail 'wizard does not warn users not to store GitHub tokens in the panel'
+    grep_fixed 'https://github.com/settings/tokens/new?scopes=codespace' "$SCRIPT" \
+        || fail 'wizard does not give a direct GitHub token creation path'
+    grep_fixed 'as a ${WHITE}Plaintext${NC} variable' "$SCRIPT" \
+        || fail 'wizard does not clarify the CODESPACE_NAME Cloudflare binding type'
+    grep_fixed 'Add these as ${WHITE}Secret${NC} variables' "$SCRIPT" \
+        || fail 'wizard does not clarify GitHub token and wake secret binding types'
+    grep_fixed 'Worker wake URL (https optional, /wake optional)' "$SCRIPT" \
+        || fail 'wizard does not clarify acceptable Worker URL formats'
     grep_fixed 'The wake secret is shown once' "$SCRIPT" \
         || fail 'wizard does not warn that the raw wake secret is not persisted'
     grep_fixed '^https://([A-Za-z0-9][A-Za-z0-9.-]*[.][A-Za-z0-9.-]+)' "$SCRIPT" \
@@ -681,6 +691,20 @@ test_docs_cover_panel_waker_setup() {
         || fail 'Worker README still encourages typing the wake secret directly into curl commands'
     grep_fixed 'keeps the wake secret out of shell history' "$README" \
         || fail 'README does not explain safer wake secret CLI handling'
+    grep_fixed 'https://github.com/settings/tokens/new?scopes=codespace' "$README" \
+        || fail 'README does not give a direct GitHub token creation path'
+    grep_fixed 'CODESPACE_NAME`: **Plaintext** variable' "$README" \
+        || fail 'README does not clarify CODESPACE_NAME as a plaintext Cloudflare variable'
+    grep_fixed 'GITHUB_TOKEN`: **Secret** variable' "$README" \
+        || fail 'README does not clarify GITHUB_TOKEN as a Cloudflare secret'
+    grep_fixed 'with or without `https://`, and with or without `/wake`' "$README" \
+        || fail 'README does not clarify accepted Worker URL formats'
+    grep_fixed 'CODESPACE_NAME` as a **Plaintext** variable' "$WORKER_README" \
+        || fail 'Worker README does not clarify CODESPACE_NAME dashboard binding type'
+    grep_fixed 'GITHUB_TOKEN` and `WAKE_SECRET` as **Secret** variables' "$WORKER_README" \
+        || fail 'Worker README does not clarify Worker secret binding types'
+    grep_fixed 'VS Code Desktop' "$README" \
+        || fail 'README does not mention VS Code Desktop fallback for slow browser Codespaces'
     pass 'docs cover panel waker setup'
 }
 
@@ -840,6 +864,8 @@ test_docs_and_public_configs_are_consistent() {
         || fail 'README does not document G2RAY_QR_MODE'
     grep_fixed 'G2RAY_EXTRA_FALLBACK_IPS' "$README" \
         || fail 'README does not document G2RAY_EXTRA_FALLBACK_IPS'
+    grep_fixed 'configs-to-copy-for-mobile.txt' "$README" \
+        || fail 'README does not document the mobile copy-link fallback for QR scan failures'
     grep_fixed 'Community Donated Configs (SUB)</summary>' "$README" \
         || fail 'README community subscription summary is not wrapped in a details block'
     if grep_fixed 'without impacting your own speed or exposing personal data' "$README"; then
@@ -895,6 +921,8 @@ test_menu_loop_and_link_output_are_tidy() {
         || fail 'wait_for_port does not provide animated progress frames'
     grep_fixed 'Initializing engine... (${i}s)' "$SCRIPT" \
         || fail 'wait_for_port does not show elapsed initialization time'
+    grep_fixed 'Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))' "$SCRIPT" \
+        || fail 'anti-sleep toggle menu item does not show the current state inline'
     pass 'menu loop and link output are tidy'
 }
 
