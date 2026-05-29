@@ -375,12 +375,19 @@ generate_wake_secret() {
 }
 
 normalize_waker_url() {
-    local url
+    local url host port
     url=$(one_line "${1:-}")
     [[ -n "$url" ]] || return 1
-    [[ "$url" == http://* || "$url" == https://* ]] || url="https://${url}"
-    [[ "$url" == */wake ]] || url="${url%/}/wake"
-    printf '%s' "$url"
+    [[ "$url" != *[[:space:]]* ]] || return 1
+    [[ "$url" == http://* ]] && return 1
+    [[ "$url" == https://* ]] || url="https://${url}"
+    if [[ "$url" =~ ^https://([A-Za-z0-9][A-Za-z0-9.-]*[.][A-Za-z0-9.-]+)(:[0-9]+)?(/wake)?/?$ ]]; then
+        host="${BASH_REMATCH[1]:-}"
+        port="${BASH_REMATCH[2]:-}"
+        printf 'https://%s%s/wake' "$host" "$port"
+        return 0
+    fi
+    return 1
 }
 
 waker_metadata_value() {
@@ -426,7 +433,7 @@ test_cloudflare_waker() {
     worker_url=$(normalize_waker_url "${worker_url:-$(waker_metadata_value worker_url)}" 2>/dev/null || true)
     if [[ -z "$worker_url" ]]; then
         echo -ne "  ${GREEN}Worker wake URL:${NC} "
-        read -r worker_url
+        read -r worker_url || return 1
         worker_url=$(normalize_waker_url "$worker_url" 2>/dev/null || true)
     fi
     if [[ -z "$worker_url" ]]; then
@@ -435,7 +442,7 @@ test_cloudflare_waker() {
     fi
     if [[ -z "$wake_secret" ]]; then
         echo -ne "  ${GREEN}Wake secret (hidden):${NC} "
-        read -r -s wake_secret
+        read -r -s wake_secret || { echo ""; return 1; }
         echo ""
     fi
     if [[ -z "$wake_secret" ]]; then
@@ -509,11 +516,11 @@ setup_cloudflare_waker() {
     echo -e "  ${GREEN}${wake_secret}${NC}"
     echo -e "  ${DIM}Fingerprint saved locally: ${wake_fingerprint}${NC}\n"
     echo -ne "  ${GREEN}Is the Worker deployed with those values? (y/n):${NC} "
-    read -r ready
+    read -r ready || { touch "$WAKER_PROMPT_FILE" 2>/dev/null || true; return 0; }
     [[ "$ready" =~ ^[Yy]$ ]] || { echo -e "  ${DIM}Setup paused. Open option 15 when ready.${NC}"; sleep 2; return 0; }
 
     echo -ne "  ${GREEN}Worker wake URL:${NC} "
-    read -r worker_url
+    read -r worker_url || { echo -e "  ${RED}Missing Worker URL.${NC}"; sleep 2; return 1; }
     worker_url=$(normalize_waker_url "$worker_url" 2>/dev/null || true)
     if [[ -z "$worker_url" ]]; then
         echo -e "  ${RED}Invalid Worker URL.${NC}"
@@ -525,7 +532,7 @@ setup_cloudflare_waker() {
     echo -e "  ${GREEN}Saved non-sensitive waker metadata.${NC}"
     echo -e "  ${DIM}GitHub token and raw wake secret were not stored in G2ray.${NC}\n"
     echo -ne "  ${GREEN}Test Worker now? (y/n):${NC} "
-    read -r do_test
+    read -r do_test || do_test="n"
     if [[ "$do_test" =~ ^[Yy]$ ]]; then
         test_cloudflare_waker "$worker_url" "$wake_secret" || true
     fi
@@ -536,9 +543,10 @@ reset_waker_metadata() {
     local confirm
     echo -e "\n  ${YELLOW}Remove saved Worker URL/fingerprint metadata?${NC}"
     echo -ne "  ${GREEN}Proceed (y/n):${NC} "
-    read -r confirm
+    read -r confirm || return 0
     [[ "$confirm" =~ ^[Yy]$ ]] || return 0
-    rm -f "$WAKER_METADATA_FILE" "$WAKER_PROMPT_FILE" 2>/dev/null || true
+    rm -f "$WAKER_METADATA_FILE" 2>/dev/null || true
+    touch "$WAKER_PROMPT_FILE" 2>/dev/null || true
     log_event INFO "waker_metadata reset"
     echo -e "  ${GREEN}Waker metadata reset.${NC}"
     sleep 1
@@ -558,7 +566,7 @@ show_recovery_waker() {
         echo -e "  ${RED}4)${NC} Reset Saved Waker Metadata"
         echo -e "  ${RED}0)${NC} Return"
         echo -ne "  ${RED}Select:${NC} "
-        read -r choice
+        read -r choice || return 0
         case "$choice" in
             1) setup_cloudflare_waker ;;
             2) show_waker_recovery_guide ;;
@@ -582,7 +590,7 @@ maybe_prompt_waker_setup() {
     echo -e "  a Cloudflare Worker wake page so you can restart the Codespace from a browser."
     echo -e "  Do not paste the GitHub token into G2ray; the wizard sends it to Cloudflare only by your hand.\n"
     echo -ne "  ${GREEN}Set up the recovery waker now? (y/n):${NC} "
-    read -r answer
+    read -r answer || { touch "$WAKER_PROMPT_FILE" 2>/dev/null || true; return 0; }
     touch "$WAKER_PROMPT_FILE" 2>/dev/null || true
     [[ "$answer" =~ ^[Yy]$ ]] && setup_cloudflare_waker
 }

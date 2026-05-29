@@ -5,5 +5,7 @@
 /configs-subscription-base64.txt
 /configs-subscription-base64.txt.*
 /g2ray.sh.*
-/worker/codespace-waker/.dev.vars
+/worker/codespace-waker/.dev.vars*
+/worker/codespace-waker/.env
+/worker/codespace-waker/.env.*
 /worker/codespace-waker/wrangler.toml

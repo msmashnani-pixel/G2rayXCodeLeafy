@@ -173,10 +173,12 @@ npx wrangler deploy
 Wake call:
 
 ```bash
-curl -X POST -H "Authorization: Bearer YOUR_WAKE_SECRET" https://YOUR_WORKER.workers.dev/wake
+read -rsp "Wake secret: " WAKE_SECRET; echo
+curl -X POST -H "Authorization: Bearer ${WAKE_SECRET}" https://YOUR_WORKER.workers.dev/wake
+unset WAKE_SECRET
 ```
 
-See `worker/codespace-waker/README.md` for the full setup and token guidance.
+The browser form is preferred because it keeps the wake secret out of shell history. See `worker/codespace-waker/README.md` for the full setup and token guidance.
 
 ---
 

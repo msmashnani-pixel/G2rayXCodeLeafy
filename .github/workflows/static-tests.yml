@@ -7,6 +7,8 @@ on:
 jobs:
   bash-static-tests:
     runs-on: ubuntu-latest
+    env:
+      LC_ALL: C.UTF-8
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

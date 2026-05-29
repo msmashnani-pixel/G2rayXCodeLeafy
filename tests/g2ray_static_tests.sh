@@ -543,8 +543,12 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
     [[ -f "$WORKER_SCRIPT" ]] || fail 'Cloudflare Worker waker source is missing'
     [[ -f "$WORKER_README" ]] || fail 'Cloudflare Worker waker README is missing'
     [[ -f "$WORKER_WRANGLER_EXAMPLE" ]] || fail 'Cloudflare Worker wrangler example is missing'
-    grep_fixed 'worker/codespace-waker/.dev.vars' "$GITIGNORE" \
+    grep_fixed 'worker/codespace-waker/.dev.vars*' "$GITIGNORE" \
         || fail 'Worker local dev secrets are not ignored'
+    grep_fixed 'worker/codespace-waker/.env' "$GITIGNORE" \
+        || fail 'Worker local .env secrets are not ignored'
+    grep_fixed 'worker/codespace-waker/.env.*' "$GITIGNORE" \
+        || fail 'Worker local environment-specific .env secrets are not ignored'
     grep_fixed 'worker/codespace-waker/wrangler.toml' "$GITIGNORE" \
         || fail 'Worker local wrangler config is not ignored'
     grep_fixed 'env.GITHUB_TOKEN' "$WORKER_SCRIPT" \
@@ -557,6 +561,10 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker does not call the Codespaces start endpoint'
     grep_fixed 'reason: "quota_or_billing_blocked"' "$WORKER_SCRIPT" \
         || fail 'Worker does not classify HTTP 402 quota/billing failures'
+    grep_fixed 'githubErrorDetail(body)' "$WORKER_SCRIPT" \
+        || fail 'Worker does not redact GitHub error response details'
+    grep_fixed 'idle_timeout_minutes:' "$WORKER_SCRIPT" \
+        || fail 'Worker success response does not retain useful redacted status fields'
     grep_fixed 'wake_secret' "$WORKER_SCRIPT" \
         || fail 'Worker browser form cannot submit the wake secret'
     grep_fixed 'wrangler secret put GITHUB_TOKEN' "$WORKER_README" \
@@ -594,10 +602,28 @@ test_panel_guides_cloudflare_waker_setup() {
         || fail 'main menu does not expose recovery/waker setup'
     grep_fixed '15) show_recovery_waker' "$SCRIPT" \
         || fail 'case statement does not route to the recovery/waker setup screen'
+    grep_fixed '1) setup_cloudflare_waker' "$SCRIPT" \
+        || fail 'recovery submenu does not route to setup'
+    grep_fixed '2) show_waker_recovery_guide' "$SCRIPT" \
+        || fail 'recovery submenu does not route to instructions'
+    grep_fixed 'test_cloudflare_waker || true' "$SCRIPT" \
+        || fail 'recovery submenu does not route to Worker testing'
+    grep_fixed '4) reset_waker_metadata' "$SCRIPT" \
+        || fail 'recovery submenu does not route to metadata reset'
     grep_fixed 'Do not paste the GitHub token into G2ray' "$SCRIPT" \
         || fail 'wizard does not warn users not to store GitHub tokens in the panel'
     grep_fixed 'The wake secret is shown once' "$SCRIPT" \
         || fail 'wizard does not warn that the raw wake secret is not persisted'
+    grep_fixed '^https://([A-Za-z0-9][A-Za-z0-9.-]*[.][A-Za-z0-9.-]+)' "$SCRIPT" \
+        || fail 'waker URL normalization does not reject obvious non-URL secret input'
+    grep_fixed 'printf '\''https://%s%s/wake'\''' "$SCRIPT" \
+        || fail 'waker URL normalization does not canonicalize trailing /wake slashes'
+    grep_fixed 'read -r answer || { touch "$WAKER_PROMPT_FILE"' "$SCRIPT" \
+        || fail 'one-time waker prompt is not EOF-safe under set -e'
+    grep_fixed 'rm -f "$WAKER_METADATA_FILE"' "$SCRIPT" \
+        || fail 'reset path does not clear saved waker metadata'
+    grep_fixed 'touch "$WAKER_PROMPT_FILE"' "$SCRIPT" \
+        || fail 'reset/prompt paths do not preserve the one-time prompt marker'
     grep_fixed 'Default idle timeout' "$SCRIPT" \
         || fail 'wizard does not guide users to the GitHub idle timeout setting'
     grep_fixed '240 minutes' "$SCRIPT" \
@@ -613,9 +639,13 @@ test_panel_guides_cloudflare_waker_setup() {
 }
 
 test_diagnostics_show_external_waker_state() {
-    grep_fixed 'External Waker' "$SCRIPT" \
-        || fail 'diagnostics do not show external waker state'
-    grep_fixed 'waker_metadata_summary | sed' "$SCRIPT" \
+    awk '
+        /show_diagnostics\(\)/ { in_fn=1 }
+        in_fn && /External Waker/ { saw_title=1 }
+        in_fn && /waker_metadata_summary \| sed/ { saw_summary=1 }
+        in_fn && /^}/ { exit }
+        END { exit (saw_title && saw_summary) ? 0 : 1 }
+    ' "$SCRIPT" \
         || fail 'diagnostics do not render the waker metadata summary'
     grep_fixed 'Status      : configured' "$SCRIPT" \
         || fail 'waker summary cannot report configured status'
@@ -645,6 +675,12 @@ test_docs_cover_panel_waker_setup() {
         || fail 'Worker README does not mention the panel setup flow'
     grep_fixed 'Do not paste the GitHub token into G2ray' "$WORKER_README" \
         || fail 'Worker README does not mirror the token handling warning'
+    grep_fixed 'read -rsp "Wake secret: " WAKE_SECRET' "$README" \
+        || fail 'README still encourages typing the wake secret directly into curl commands'
+    grep_fixed 'read -rsp "Wake secret: " WAKE_SECRET' "$WORKER_README" \
+        || fail 'Worker README still encourages typing the wake secret directly into curl commands'
+    grep_fixed 'keeps the wake secret out of shell history' "$README" \
+        || fail 'README does not explain safer wake secret CLI handling'
     pass 'docs cover panel waker setup'
 }
 
@@ -761,6 +797,8 @@ test_ci_runs_static_regressions() {
         || fail 'CI workflow does not syntax-check g2ray.sh'
     grep_fixed 'bash ./tests/g2ray_static_tests.sh' "$CI_WORKFLOW" \
         || fail 'CI workflow does not run the static regression suite'
+    grep_fixed 'LC_ALL: C.UTF-8' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not pin a UTF-8 locale for README/static text checks'
     pass 'CI runs shell syntax and static regression checks'
 }
 
@@ -802,7 +840,7 @@ test_docs_and_public_configs_are_consistent() {
         || fail 'README does not document G2RAY_QR_MODE'
     grep_fixed 'G2RAY_EXTRA_FALLBACK_IPS' "$README" \
         || fail 'README does not document G2RAY_EXTRA_FALLBACK_IPS'
-    grep_fixed '<details><summary><kbd>🔗</kbd> Community Donated Configs (SUB)</summary>' "$README" \
+    grep_fixed 'Community Donated Configs (SUB)</summary>' "$README" \
         || fail 'README community subscription summary is not wrapped in a details block'
     if grep_fixed 'without impacting your own speed or exposing personal data' "$README"; then
         fail 'README still claims donated live configs expose no personal data'

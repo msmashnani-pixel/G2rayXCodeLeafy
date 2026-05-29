@@ -64,7 +64,7 @@ async function startCodespace(name, token) {
       ok: false,
       status: res.status,
       reason: "quota_or_billing_blocked",
-      body
+      detail: githubErrorDetail(body)
     }, 402);
   }
 
@@ -73,7 +73,7 @@ async function startCodespace(name, token) {
       ok: false,
       status: res.status,
       reason: "github_token_rejected_or_missing_scope",
-      body
+      detail: githubErrorDetail(body)
     }, res.status);
   }
 
@@ -82,7 +82,7 @@ async function startCodespace(name, token) {
       ok: false,
       status: res.status,
       reason: "codespace_not_found_or_token_cannot_access_it",
-      body
+      detail: githubErrorDetail(body)
     }, 404);
   }
 
@@ -90,7 +90,10 @@ async function startCodespace(name, token) {
     ok: res.ok || res.status === 202 || res.status === 304 || res.status === 409,
     status: res.status,
     codespace: name,
-    body
+    state: body && typeof body === "object" ? body.state || null : null,
+    last_used_at: body && typeof body === "object" ? body.last_used_at || null : null,
+    idle_timeout_minutes: body && typeof body === "object" ? body.idle_timeout_minutes || null : null,
+    message: "Codespace start request accepted. Wait for the Codespace and app route to become ready."
   }, res.ok || res.status === 202 || res.status === 304 || res.status === 409 ? 200 : 502);
 }
 
@@ -115,6 +118,14 @@ function parseBody(text) {
   } catch {
     return text.slice(0, 1000);
   }
+}
+
+function githubErrorDetail(body) {
+  if (!body || typeof body !== "object") return null;
+  return {
+    message: body.message || null,
+    documentation_url: body.documentation_url || null
+  };
 }
 
 function json(data, status = 200) {
@@ -148,6 +159,8 @@ function renderForm() {
   </label>
   <button type="submit">Start Codespace</button>
 </form>
-<p>CLI usage:</p>
-<pre><code>curl -X POST -H "Authorization: Bearer YOUR_WAKE_SECRET" https://YOUR_WORKER/wake</code></pre>`;
+<p>Browser use is recommended so the wake secret stays out of shell history. For CLI use, prefer an environment variable over typing the secret directly into the command.</p>
+<pre><code>read -rsp "Wake secret: " WAKE_SECRET; echo
+curl -X POST -H "Authorization: Bearer \${WAKE_SECRET}" https://YOUR_WORKER/wake
+unset WAKE_SECRET</code></pre>`;
 }

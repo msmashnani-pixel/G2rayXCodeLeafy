@@ -86,12 +86,14 @@ https://g2ray-codespace-waker.YOUR_SUBDOMAIN.workers.dev
 Recommended CLI call:
 
 ```bash
+read -rsp "Wake secret: " WAKE_SECRET; echo
 curl -X POST \
-  -H "Authorization: Bearer YOUR_WAKE_SECRET" \
+  -H "Authorization: Bearer ${WAKE_SECRET}" \
   https://g2ray-codespace-waker.YOUR_SUBDOMAIN.workers.dev/wake
+unset WAKE_SECRET
 ```
 
-You can also open the Worker URL in a browser and enter the wake secret in the form.
+Opening the Worker URL in a browser and entering the wake secret in the form is preferred because it keeps the secret out of shell history.
 
 ## Expected Responses
 
@@ -104,6 +106,6 @@ You can also open the Worker URL in a browser and enter the wake secret in the f
 ## Security Notes
 
 - Do not put `GITHUB_TOKEN` or `WAKE_SECRET` in `wrangler.toml`.
-- Do not commit `.dev.vars`.
+- Do not commit `.dev.vars*`, `.env`, or `.env.*`.
 - Prefer the `Authorization: Bearer ...` header over putting secrets in URLs.
 - Rotate the GitHub token if the Worker or Cloudflare account is compromised.
