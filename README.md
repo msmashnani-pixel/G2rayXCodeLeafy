@@ -90,6 +90,8 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 
 - `XRAY_PORT` **(Optional)** — Binds Xray to a custom port. Default: `443`
 - `CODESPACE_NAME` **(Optional)** — Overrides auto-detection of the app domain.
+- `G2RAY_QR_MODE` **(Optional)** — Controls QR display in the config view: `recommended` (default), `all`, or `none`.
+- `G2RAY_EXTRA_FALLBACK_IPS` **(Optional)** — Adds comma-, semicolon-, or space-separated IP fallback candidates before auto-detected ones.
 
 </details>
 
@@ -100,7 +102,7 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 When launched, the panel provides a 1-to-14 numerical selection menu. Simply type the number corresponding to the action you want to take.
 
 ```bash
-# If panel did now get shown:
+# If panel did not get shown:
 bash ./g2ray.sh
 ```
 

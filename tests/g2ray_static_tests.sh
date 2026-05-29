@@ -364,9 +364,55 @@ test_xhttp_route_settling_is_observable() {
 test_docs_and_public_configs_are_consistent() {
     grep_fixed '1-to-14' "$README" \
         || fail 'README menu count is stale'
+    if grep_fixed 'did now get shown' "$README"; then
+        fail 'README still contains the "did now" typo'
+    fi
+    grep_fixed 'G2RAY_QR_MODE' "$README" \
+        || fail 'README does not document G2RAY_QR_MODE'
+    grep_fixed 'G2RAY_EXTRA_FALLBACK_IPS' "$README" \
+        || fail 'README does not document G2RAY_EXTRA_FALLBACK_IPS'
     awk 'NF && seen[$0]++ { dup=1 } END { exit dup ? 1 : 0 }' "$CONFIGS" \
         || fail 'configs.txt contains duplicate non-empty VLESS entries'
     pass 'docs and public configs are consistent'
+}
+
+test_devcontainer_tooling_is_not_duplicated() {
+    grep_fixed 'dnsutils' "$ROOT_DIR/.devcontainer/Dockerfile" \
+        || fail 'Dockerfile does not install dnsutils for dig-based DNS resolution'
+    if grep_fixed 'vnstat' "$ROOT_DIR/.devcontainer/Dockerfile"; then
+        fail 'Dockerfile still installs unused vnstat'
+    fi
+    if grep_fixed 'cli.github.com/packages' "$ROOT_DIR/.devcontainer/Dockerfile"; then
+        fail 'Dockerfile still installs gh manually despite the devcontainer feature'
+    fi
+    grep_fixed 'ghcr.io/devcontainers/features/github-cli:1' "$ROOT_DIR/.devcontainer/devcontainer.json" \
+        || fail 'devcontainer no longer installs gh through the github-cli feature'
+    grep_fixed '.devcontainer/Dockerfile text eol=lf' "$ROOT_DIR/.gitattributes" \
+        || fail 'Dockerfile line endings are not pinned to LF'
+    grep_fixed 'assets/message.txt text eol=lf' "$ROOT_DIR/.gitattributes" \
+        || fail 'message.txt line endings are not pinned to LF'
+    pass 'devcontainer tooling and LF policy are clean'
+}
+
+test_menu_loop_and_link_output_are_tidy() {
+    if grep_fixed '( fetch_remote_message >/dev/null 2>&1 & )' "$SCRIPT"; then
+        fail 'menu loop still starts a redundant remote-message fetch every render'
+    fi
+    if awk '
+        /generate_ip_links\(\)/ { in_fn=1 }
+        in_fn && /generate_ordered_links\(\)/ { exit }
+        in_fn && /generate_link_for_address "\$address" "-ip\$\{index\}"/ { saw_link=1; next }
+        in_fn && saw_link && /printf '\''\\n'\''/ { bad=1; exit }
+        in_fn && saw_link && /printed=true/ { saw_link=0 }
+        END { exit bad ? 0 : 1 }
+    ' "$SCRIPT"; then
+        fail 'generate_ip_links still appends an unconditional blank line after each link'
+    fi
+    grep_fixed 'frames=("-" "\\" "|" "/")' "$SCRIPT" \
+        || fail 'wait_for_port does not provide animated progress frames'
+    grep_fixed 'Initializing engine... (${i}s)' "$SCRIPT" \
+        || fail 'wait_for_port does not show elapsed initialization time'
+    pass 'menu loop and link output are tidy'
 }
 
 test_wait_for_port_increment_is_set_e_safe
@@ -385,3 +431,5 @@ test_terminal_branding_is_customized_red
 test_runtime_diagnostics_logging
 test_xhttp_route_settling_is_observable
 test_docs_and_public_configs_are_consistent
+test_devcontainer_tooling_is_not_duplicated
+test_menu_loop_and_link_output_are_tidy

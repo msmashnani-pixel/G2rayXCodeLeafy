@@ -505,10 +505,15 @@ start_xray() {
 }
 
 wait_for_port() {
-    local i=0
-    echo -ne "  ${GREEN}⠋${NC} ${DIM}Initializing engine...${NC} "
-    while ! is_port_open && (( i < 15 )); do sleep 1; i=$((i + 1)); done
-    echo ""
+    local i=0 frame_index=0
+    local frames=("-" "\\" "|" "/")
+    while ! is_port_open && (( i < 15 )); do
+        printf "\r  ${GREEN}%s${NC} ${DIM}Initializing engine... (${i}s)${NC}" "${frames[$frame_index]}"
+        frame_index=$(( (frame_index + 1) % ${#frames[@]} ))
+        sleep 1
+        i=$((i + 1))
+    done
+    printf "\r  ${GREEN}%s${NC} ${DIM}Initializing engine... (${i}s)${NC}        \n" "${frames[$frame_index]}"
     if is_port_open; then
         log_event INFO "wait_for_port open port=${XRAY_PORT} seconds=${i}"
         return 0
@@ -807,11 +812,12 @@ generate_ip_link() {
 }
 
 generate_ip_links() {
-    local address index=1
+    local address index=1 printed=false
     while IFS= read -r address; do
         [[ -n "$address" ]] || continue
+        [[ "$printed" == true ]] && printf '\n'
         generate_link_for_address "$address" "-ip${index}"
-        printf '\n'
+        printed=true
         index=$(( index + 1 ))
     done < <(resolve_domain_ips "$PORT_DOMAIN")
 }
@@ -1077,7 +1083,6 @@ else
 fi
 
 while true; do
-    ( fetch_remote_message >/dev/null 2>&1 & )
     refresh_screen
 
     if xray_running; then

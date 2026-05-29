@@ -7,11 +7,7 @@ LABEL maintainer="G2rayXCodeLeafy" \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash curl wget unzip ca-certificates sudo openssl uuid-runtime tmux tzdata \
-        qrencode jq vnstat bc net-tools gnupg libcap2-bin iproute2 \
-    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
+        qrencode jq bc net-tools libcap2-bin iproute2 dnsutils \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN wget -qO xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
