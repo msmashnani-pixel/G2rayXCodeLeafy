@@ -158,6 +158,45 @@ async function testHealthTreatsHttp400RouteAsUsable() {
   console.log("PASS: Worker route readiness matches panel HTTP 400/200 semantics");
 }
 
+async function testWakeRequiresStableRouteReadiness() {
+  let routeCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ state: "Available" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      const status = routeCalls === 1 ? 200 : routeCalls === 2 ? 404 : 200;
+      return new Response("", { status });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv(), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.route_ready, true);
+  assert.equal(body.route_probe.attempts, 4);
+  assert.equal(body.route_probe.stable_probes, 2);
+  console.log("PASS: Worker rejects transient single route success");
+}
+
 async function testDashboardIncludesRouteHistorySummaryUi() {
   const response = await worker.fetch(new Request("https://worker.example/wake"), baseEnv(), {});
   const html = await response.text();
@@ -184,6 +223,7 @@ try {
   await testGithubHttp429Classification();
   await testWakeFailureIncludesNextAction();
   await testHealthTreatsHttp400RouteAsUsable();
+  await testWakeRequiresStableRouteReadiness();
   await testDashboardIncludesRouteHistorySummaryUi();
   await testHistoryRejectsBadSecretClearly();
 } finally {

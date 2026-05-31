@@ -4,6 +4,7 @@ const GITHUB_STATE_WAIT_MS = 120000;
 const GITHUB_STATE_POLL_INTERVAL_MS = 5000;
 const ROUTE_WAIT_MS = 35000;
 const ROUTE_POLL_INTERVAL_MS = 3000;
+const ROUTE_READY_STABLE_PROBES = 2;
 const FETCH_TIMEOUT_MS = 10000;
 const ROUTE_FETCH_TIMEOUT_MS = 7000;
 const HISTORY_KEY_PREFIX = "history:";
@@ -658,6 +659,7 @@ async function waitForXhttpRoute(name, port) {
   const startedAt = Date.now();
   const deadline = startedAt + ROUTE_WAIT_MS;
   let attempts = 0;
+  let stableProbes = 0;
   let last = {
     url: routeUrl(name, port),
     usable: false,
@@ -665,13 +667,21 @@ async function waitForXhttpRoute(name, port) {
     latency_ms: null,
     attempts,
     waited_ms: 0,
+    stable_probes: stableProbes,
     error: "not_checked"
   };
 
   while (Date.now() <= deadline) {
     attempts += 1;
     last = await probeXhttpRoute(name, port, attempts, startedAt);
-    if (last.usable) return last;
+    if (last.usable) {
+      stableProbes += 1;
+      last.stable_probes = stableProbes;
+      if (stableProbes >= ROUTE_READY_STABLE_PROBES) return last;
+      continue;
+    }
+    stableProbes = 0;
+    last.stable_probes = stableProbes;
 
     if (Date.now() + ROUTE_POLL_INTERVAL_MS > deadline) break;
     await sleep(ROUTE_POLL_INTERVAL_MS);
