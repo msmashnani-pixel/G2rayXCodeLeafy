@@ -317,17 +317,39 @@ test_doctor_json_sanitizes_invalid_port() {
     pass "doctor json remains valid with invalid port input"
 }
 
-test_route_wait_attempts_count_first_probe() {
+test_route_wait_requires_stable_usable_probes() {
     reset_runtime_paths
     local probes=0
     xhttp_probe_metrics() {
         probes=$((probes + 1))
         printf '200 7\n'
     }
-    wait_for_xhttp_route_ready "behavior_attempts" 1 >/dev/null || fail "route wait did not accept usable first probe"
-    awk -F '\t' '$2 == "behavior_attempts" && $3 == "ready" && $4 == "200" && $5 == "7" && $7 == "1" { found = 1 } END { exit !found }' "$ROUTE_SETTLING_HISTORY_FILE" \
-        || fail "route wait did not record first probe as attempt 1"
-    pass "route wait attempts count the first probe"
+    wait_for_xhttp_route_ready "behavior_stable" 1 >/dev/null || fail "route wait did not accept stable usable probes"
+    awk -F '\t' '$2 == "behavior_stable" && $3 == "ready" && $4 == "200" && $5 == "7" && $7 == "2" { found = 1 } END { exit !found }' "$ROUTE_SETTLING_HISTORY_FILE" \
+        || fail "route wait did not require and record two stable usable probes"
+    pass "route wait requires stable usable probes"
+}
+
+test_route_wait_rejects_transient_single_success() {
+    reset_runtime_paths
+    local probes_file="$TMP_ROOT/route-wait-flap-count.txt"
+    printf '0\n' > "$probes_file"
+    xhttp_probe_metrics() {
+        local probes
+        probes=$(cat "$probes_file")
+        probes=$((probes + 1))
+        printf '%s\n' "$probes" > "$probes_file"
+        case "$probes" in
+            1) printf '200 11\n' ;;
+            2) printf '404 12\n' ;;
+            3) printf '200 13\n' ;;
+            *) printf '200 14\n' ;;
+        esac
+    }
+    wait_for_xhttp_route_ready "behavior_flap" 10 >/dev/null || fail "route wait did not recover after transient success then stable success"
+    awk -F '\t' '$2 == "behavior_flap" && $3 == "ready" && $4 == "200" && $7 == "4" { found = 1 } END { exit !found }' "$ROUTE_SETTLING_HISTORY_FILE" \
+        || fail "route wait accepted a transient single 200 instead of waiting for stability"
+    pass "route wait rejects transient single success"
 }
 
 test_recover_now_success_clears_nonfatal_port_public_failure() {
@@ -390,6 +412,7 @@ test_usable_fallback_ips_uses_fresh_cache
 test_route_settling_history_records_summary
 test_doctor_json_reports_probe_state
 test_doctor_json_sanitizes_invalid_port
-test_route_wait_attempts_count_first_probe
+test_route_wait_requires_stable_usable_probes
+test_route_wait_rejects_transient_single_success
 test_recover_now_success_clears_nonfatal_port_public_failure
 test_diagnostic_snapshot_writes_readable_history

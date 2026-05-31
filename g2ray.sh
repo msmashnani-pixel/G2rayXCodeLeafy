@@ -57,12 +57,16 @@ SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
 ROUTE_WAIT_SEC="${G2RAY_ROUTE_WAIT_SEC:-120}"
 FORCE_RECONNECT_ROUTE_WAIT_SEC="${G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC:-60}"
+ROUTE_READY_STABLE_PROBES="${G2RAY_ROUTE_READY_STABLE_PROBES:-2}"
+ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
 PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
 WAKER_TEST_TIMEOUT_SEC="${G2RAY_WAKER_TEST_TIMEOUT_SEC:-180}"
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$WAKER_TEST_TIMEOUT_SEC" =~ ^[0-9]+$ && "$WAKER_TEST_TIMEOUT_SEC" -ge 30 ]] || WAKER_TEST_TIMEOUT_SEC=180
+[[ "$ROUTE_READY_STABLE_PROBES" =~ ^[0-9]+$ && "$ROUTE_READY_STABLE_PROBES" -ge 1 ]] || ROUTE_READY_STABLE_PROBES=2
+[[ "$ROUTE_READY_STABLE_SLEEP_SEC" =~ ^[0-9]+$ ]] || ROUTE_READY_STABLE_SLEEP_SEC=1
 
 umask 077
 mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
@@ -1088,7 +1092,7 @@ repair_codespace_port_route() {
 }
 
 wait_for_xhttp_route_ready() {
-    local reason="${1:-startup}" max_wait="${2:-$ROUTE_WAIT_SEC}" start now elapsed xcode=0 xms=0 attempt=0
+    local reason="${1:-startup}" max_wait="${2:-$ROUTE_WAIT_SEC}" start now elapsed xcode=0 xms=0 attempt=0 stable=0
     [[ "$max_wait" =~ ^[0-9]+$ ]] || max_wait=120
     start=$(date +%s 2>/dev/null || printf '0')
     while true; do
@@ -1097,17 +1101,26 @@ wait_for_xhttp_route_ready() {
         now=$(date +%s 2>/dev/null || printf '0')
         elapsed=$(( now - start ))
         if xhttp_status_usable "$xcode"; then
-            log_event INFO "runtime_ready reason=${reason} route_wait_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} wait_sec=${elapsed}"
-            record_route_settling_metric "$reason" "ready" "${xcode:-0}" "${xms:-0}" "$elapsed" "$attempt"
-            return 0
+            stable=$(( stable + 1 ))
+            if (( stable >= ROUTE_READY_STABLE_PROBES )); then
+                log_event INFO "runtime_ready reason=${reason} route_wait_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} wait_sec=${elapsed} stable_probes=${stable}"
+                record_route_settling_metric "$reason" "ready" "${xcode:-0}" "${xms:-0}" "$elapsed" "$attempt"
+                return 0
+            fi
+        else
+            stable=0
         fi
         (( elapsed >= max_wait )) && break
         if (( attempt == 1 || attempt % 5 == 0 )); then
             ensure_codespace_port_public >/dev/null 2>&1 || true
         fi
-        sleep 3
+        if (( stable > 0 )); then
+            sleep "$ROUTE_READY_STABLE_SLEEP_SEC"
+        else
+            sleep 3
+        fi
     done
-    log_event WARN "runtime_ready reason=${reason} route_wait_timeout xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} wait_sec=${max_wait}"
+    log_event WARN "runtime_ready reason=${reason} route_wait_timeout xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} wait_sec=${max_wait} stable_probes=${stable}"
     record_route_settling_metric "$reason" "timeout" "${xcode:-0}" "${xms:-0}" "$max_wait" "$attempt"
     return 1
 }
