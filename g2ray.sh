@@ -58,7 +58,7 @@ SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
 ROUTE_WAIT_SEC="${G2RAY_ROUTE_WAIT_SEC:-120}"
 FORCE_RECONNECT_ROUTE_WAIT_SEC="${G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC:-60}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
-PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-60}"
+PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
 WAKER_TEST_TIMEOUT_SEC="${G2RAY_WAKER_TEST_TIMEOUT_SEC:-180}"
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
@@ -335,7 +335,7 @@ self_heal_state_summary() {
 last_log_event_matching() {
     local pattern="$1" line
     [[ -s "$LOG_FILE" ]] || { printf 'none recorded'; return 0; }
-    line=$(tail -n 500 "$LOG_FILE" 2>/dev/null | grep -E "$pattern" | tail -n 1 || true)
+    line=$(grep -E "$pattern" "$LOG_FILE" 2>/dev/null | tail -n 1 || true)
     if [[ -z "$line" ]]; then
         printf 'none recorded'
         return 0
@@ -415,6 +415,14 @@ blacklisted_route_candidates() {
     while IFS= read -r ip; do
         valid_ipv4 "$ip" && printf '%s\n' "$ip"
     done < "$BLACKLISTED_ROUTE_CANDIDATES_FILE"
+}
+
+cached_route_candidate_ips() {
+    [[ -s "$ROUTE_HEALTH_FILE" ]] || return 0
+    awk -F '\t' 'NF >= 2 {print $2}' "$ROUTE_HEALTH_FILE" 2>/dev/null \
+        | while IFS= read -r ip; do
+            valid_ipv4 "$ip" && printf '%s\n' "$ip"
+        done
 }
 
 candidate_blacklisted() {
@@ -521,6 +529,7 @@ resolve_domain_ips() {
     candidates=$({
         pinned_route_value
         manual_route_candidates
+        cached_route_candidate_ips
         if [[ -n "${G2RAY_EXTRA_FALLBACK_IPS:-}" ]]; then
             printf '%s\n' "$G2RAY_EXTRA_FALLBACK_IPS" | tr ',; ' '\n'
         fi

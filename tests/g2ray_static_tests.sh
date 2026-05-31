@@ -743,6 +743,8 @@ test_route_candidate_monitor_is_bounded() {
         || fail 'route candidate monitor cannot refresh candidate health'
     grep_fixed 'route_candidate_health_summary()' "$SCRIPT" \
         || fail 'diagnostics cannot summarize route candidate health'
+    grep_fixed 'cached_route_candidate_ips()' "$SCRIPT" \
+        || fail 'previously measured route candidates are not reused across resolver refreshes'
     grep_fixed 'record_route_candidate_health "$ip" "$ip_probe" "$ip_ms"' "$SCRIPT" \
         || fail 'route candidate monitor does not persist per-candidate probe results'
     grep_fixed 'refresh_route_candidate_health >/dev/null 2>&1 || true' "$SCRIPT" \
@@ -794,6 +796,8 @@ test_route_candidate_manager_and_live_monitor_are_present() {
         || fail 'cached route ordering does not consider pinned routes'
     grep_fixed 'while IFS= read -r ip; do' "$SCRIPT" \
         || fail 'resolver does not include persisted pinned/manual route candidates'
+    grep_fixed 'cached_route_candidate_ips' "$SCRIPT" \
+        || fail 'resolver does not include cached measured route candidates'
     grep_fixed 'append_unique_route "$MANUAL_ROUTE_CANDIDATES_FILE" "$ip" || return 1' "$SCRIPT" \
         || fail 'manual route additions do not report persistence failures'
     grep_fixed '_atomic_write "$PINNED_ROUTE_FILE" "$ip" || return 1' "$SCRIPT" \
@@ -838,6 +842,8 @@ test_soft_recovery_and_route_memory_are_present() {
         || fail 'hard repair paths cannot bypass port-public throttling'
     grep_fixed 'PORT_PUBLIC_STAMP_FILE=' "$SCRIPT" \
         || fail 'port visibility calls are not timestamp-throttled'
+    grep_fixed 'PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"' "$SCRIPT" \
+        || fail 'port visibility default TTL is too chatty for steady-state health checks'
     grep_fixed 'PORT_PUBLIC_STAMP_FILE}.${CODESPACE_NAME}.${XRAY_PORT}' "$SCRIPT" \
         || fail 'port visibility cache is not scoped by codespace and port'
     grep_fixed 'LAST_GOOD_ROUTE_FILE=' "$SCRIPT" \
@@ -864,6 +870,8 @@ test_soft_recovery_and_route_memory_are_present() {
         || fail 'diagnostic snapshots are not written to the diagnostic log'
     grep_fixed 'log_diagnostic_snapshot "interactive"' "$SCRIPT" \
         || fail 'diagnostics do not write a persistent snapshot'
+    grep_fixed 'grep -E "$pattern" "$LOG_FILE"' "$SCRIPT" \
+        || fail 'last known diagnostics summary only scans a recent log tail'
     grep_fixed '6) recover_now' "$SCRIPT" \
         || fail 'menu option 6 does not use soft recovery first'
     pass 'soft recovery, route memory, headless status, and persistent logs are present'

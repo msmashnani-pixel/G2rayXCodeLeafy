@@ -38,6 +38,7 @@ reset_runtime_paths() {
     DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
     WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
     XRAY_PID_FILE="$DATA_DIR/xray.pid"
+    rm -rf "$DATA_DIR" "$LOG_DIR"
     mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
     : > "$LOG_FILE"
     : > "$STRUCTURED_LOG_FILE"
@@ -222,6 +223,36 @@ test_pinned_route_is_a_durable_candidate_source() {
     pass "pinned route stays in resolver candidates after cache refresh"
 }
 
+test_cached_route_health_is_a_durable_candidate_source() {
+    reset_runtime_paths
+    DEFAULT_FALLBACK_IPS=""
+    G2RAY_EXTRA_FALLBACK_IPS=""
+    json_dns_ips() { return 0; }
+    curl_remote_ip() { return 0; }
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-05-30T00:00:00Z	20.0.0.8	200	70	true
+EOF
+    mapfile -t routes < <(resolve_domain_ips "")
+    [[ "${routes[0]:-}" == "20.0.0.8" ]] || fail "cached route health was not reused as a resolver candidate"
+    pass "cached route health keeps discovered candidates durable"
+}
+
+test_last_known_state_scans_full_current_log() {
+    reset_runtime_paths
+    for _i in $(seq 1 700); do
+        printf '2026-05-30T00:00:00Z [INFO] filler event\n' >> "$LOG_FILE"
+    done
+    printf '2026-05-30T00:01:00Z [WARN] port_public failed port=443 detail=test\n' >> "$LOG_FILE"
+    for _i in $(seq 1 700); do
+        printf '2026-05-30T00:02:00Z [INFO] health engine=running listener=open\n' >> "$LOG_FILE"
+    done
+    local summary
+    summary="$(last_known_state_summary)"
+    grep -Fq 'port_public failed port=443 detail=test' <<< "$summary" \
+        || fail "last known state did not scan beyond the recent log tail"
+    pass "last known state scans the full current log"
+}
+
 test_usable_fallback_ips_uses_fresh_cache() {
     reset_runtime_paths
     ROUTE_HEALTH_TTL_SEC=300
@@ -353,6 +384,8 @@ test_blacklisted_route_is_excluded_from_cached_exports
 test_manual_route_candidates_are_validated_and_resettable
 test_route_preference_write_failures_return_failure
 test_pinned_route_is_a_durable_candidate_source
+test_cached_route_health_is_a_durable_candidate_source
+test_last_known_state_scans_full_current_log
 test_usable_fallback_ips_uses_fresh_cache
 test_route_settling_history_records_summary
 test_doctor_json_reports_probe_state
