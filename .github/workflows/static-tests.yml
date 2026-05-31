@@ -18,3 +18,9 @@ jobs:
 
       - name: Run static regression tests
         run: bash ./tests/g2ray_static_tests.sh
+
+      - name: Run behavior regression tests
+        run: bash ./tests/g2ray_behavior_tests.sh
+
+      - name: Run Worker behavior tests
+        run: node ./tests/worker_behavior_tests.mjs

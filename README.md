@@ -98,7 +98,7 @@ Donate your generated config directly from the CLI to share access with the comm
    → Allow 2-3 minutes for the container to build
 
 5. **Launch Panel**
-   → The G2ray CLI panel auto-starts in the terminal!
+   → The G2ray CLI panel auto-starts in the terminal. On a fresh Codespace, choose `1) Generate Config & Start`; after config generation, the panel can guide Worker setup, show a recovery card, and open diagnostics.
 
 If browser Codespaces stays on a loading screen for a long time, open the same Codespace in **VS Code Desktop** from the GitHub Codespaces page. The panel runs the same way there and is often faster on slow browser sessions.
 
@@ -115,10 +115,13 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_MAX_FALLBACK_LINKS` **(Optional)** — Caps exported IP fallback links. Default: `3`.
 - `G2RAY_ROUTE_MONITOR_MAX_CANDIDATES` **(Optional)** — Caps cached candidate route probes shown in diagnostics. Default: `8`, hard-capped at `12`.
 - `G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES` **(Optional)** — Caps live fallback route probes in option `14) Diagnostics`. Default: `12`.
+- `G2RAY_ROUTE_HEALTH_TTL_SEC` **(Optional)** — Seconds cached route health can be reused to order exported configs before refreshing. Default: `300`.
+- `G2RAY_PORT_PUBLIC_TTL_SEC` **(Optional)** — Seconds to trust the last successful `gh codespace ports visibility 443:public` call before calling GitHub again. Default: `60`.
+- `G2RAY_WAKER_TEST_TIMEOUT_SEC` **(Optional)** — Seconds the panel waits when testing the Cloudflare Worker from option `15) Recovery / Waker Setup`. Default: `180`.
 - `G2RAY_EDGE_RECONNECT_THRESHOLD` **(Optional)** — Number of consecutive unreachable edge checks before self-heal may run a full reconnect. Default: `3`.
 - `G2RAY_RECONNECT_COOLDOWN_SEC` **(Optional)** — Minimum seconds between automatic full reconnects. Default: `300`.
 - `G2RAY_ROUTE_WAIT_SEC` **(Optional)** — Maximum seconds startup waits for the `app.github.dev` XHTTP route after a Codespace resume. Default: `120`.
-- `G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC` **(Optional)** — Maximum seconds option `6) Force Reconnect` waits for the `app.github.dev` route after repairing port visibility. Default: `60`.
+- `G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC` **(Optional)** — Maximum seconds the repair step waits for the `app.github.dev` route after toggling port visibility. Default: `60`.
 - `G2RAY_GH_TIMEOUT_SEC` **(Optional)** — Maximum seconds for GitHub CLI control-plane calls. Default: `10`.
 - `G2RAY_LOG_MAX_BYTES` **(Optional)** — Maximum bytes per runtime log before rotation. Default: `1048576`.
 - `G2RAY_LOG_ROTATE_KEEP` **(Optional)** — Number of rotated log files to keep. Default: `3`.
@@ -134,7 +137,7 @@ The panel saves high-resolution QR PNG files under `data/qr/` for the displayed 
 
 ## Usage
 
-When launched, the panel provides a 1-to-15 numerical selection menu. Simply type the number corresponding to the action you want to take.
+When launched, the panel provides a 1-to-17 numerical selection menu. Simply type the number corresponding to the action you want to take.
 
 ```bash
 # If panel did not get shown:
@@ -188,17 +191,42 @@ gh codespace ports visibility 443:public -c "$CS"
 curl -sS -o /dev/null -w "route=%{http_code} time=%{time_total}s\n" -X OPTIONS "$APP"
 ```
 
-If the route prints `000` or DNS errors after GitHub says the Codespace is active, open the Codespace once and run panel option `14) Diagnostics`. If XHTTP is `404` or unusable, use option `6) Force Reconnect`.
+If the route prints `000` or DNS errors after GitHub says the Codespace is active, open the Codespace once and run panel option `14) Diagnostics`. If XHTTP is `404` or unusable, use option `6) Recover Now`. Recover Now first tries a soft, idempotent repair: verify/start Xray, reassert port visibility, wait for the route, repair visibility once, refresh route candidates, and refresh exported configs. It offers a hard restart only if the route still looks stuck.
+
+Headless recovery/status commands:
+
+```bash
+bash ./g2ray.sh --recover-now
+bash ./g2ray.sh --doctor-json
+```
+
+`--recover-now` is non-interactive and soft-only: it verifies/starts Xray, reasserts public port visibility, waits for route readiness, refreshes route candidates, and refreshes exported configs. If the route is still settling, it can exit nonzero; open the interactive panel and use option `6) Recover Now` if you want the hard restart prompt.
+
+After `git pull`, reattach the panel or run:
+
+```bash
+bash ./g2ray.sh --silent-start
+```
+
+This starts or replaces the background supervisor with the pulled script version, verifies runtime readiness, and refreshes exports without stopping a healthy Xray process.
+
+Persistent logs are written to `logs/g2ray.log`, `logs/g2ray-events.jsonl`, and `logs/g2ray-diagnostics.log`. Diagnostics records a readable snapshot there, so you can send those logs later and still preserve route waits, repairs, probe results, supervisor state, last-good route, route-settling history, and export refreshes from previous hours.
+
+Option `16) Live Monitor` is a foreground status screen for intentional terminal monitoring. It refreshes engine state, local/edge XHTTP probes, supervisor heartbeat, self-heal counters, route-settling history, best route candidates, and recent events without restarting Xray.
+
+Option `17) Route Candidates` opens the Route Candidates manager. It shows measured route IPs, lets you add a manual IPv4 candidate, pin a preferred route, blacklist a bad route, unblacklist/remove entries, reset measured route health without wiping preferences, explicitly reset all route preferences, and refresh exports. Use this only for specific edge IPs you have measured; it does not scan broad Azure/GitHub ranges.
+
+On first setup, the panel shows a small recovery card so you can copy these recovery commands safely: `bash ./g2ray.sh --doctor-json`, `bash ./g2ray.sh --recover-now`, and, when a Worker is configured, a curl template using `Authorization: Bearer <WAKE_SECRET>`. The raw wake secret is never printed from saved metadata.
 
 ### Cloudflare Worker Waker
 
-If you want a phone/browser/curl-accessible manual wake button, this repo includes a Cloudflare Worker template in `worker/codespace-waker/`. It exposes a private `/wake` endpoint that calls GitHub's Codespaces start API. The Worker stores the GitHub token and wake secret as Cloudflare secrets, not in git.
+If you want a phone/browser/curl-accessible manual wake button, this repo includes a Cloudflare Worker template in `worker/codespace-waker/`. The `GET /wake` page is public so it can load in your browser, but `POST /wake` and the `/api/*` actions are protected by your wake secret. The Worker stores the GitHub token and wake secret as Cloudflare secrets, not in git.
 
-The Worker also provides a **Health dashboard** page for mobile use. The page itself can load in a browser, but wake, health, history, and copyable status actions require your wake secret. It shows GitHub state, XHTTP route readiness, route latency, idle timeout, last-used time, last failure, copyable status text, and optional KV-backed history. This is external health only; it does not expose your UUID, VLESS links, or the panel's full option `14) Diagnostics` output.
+The Worker also provides a **Health dashboard** page for mobile use. The page itself can load in a browser, but wake, health, history, and copyable status actions require your wake secret. It shows GitHub state, XHTTP route readiness, route latency, idle timeout, last-used time, last failure, copyable status text, route history summary, latency trend, and optional KV-backed history. This is external health only; it does not expose your UUID, VLESS links, or the panel's full option `14) Diagnostics` output.
 
 The panel can guide this from **Option 15: Recovery / Waker Setup**. It detects the current Codespace name, generates a wake secret, reminds you to set Default idle timeout to 240 minutes, and saves only non-sensitive metadata such as the Worker URL and wake-secret fingerprint.
 
-After the Worker starts the Codespace, it briefly probes the `app.github.dev` XHTTP route. If the response says `route_ready: true`, your existing VLESS configs should work again. If it says `route_ready: false` with HTTP `404`, GitHub has started the Codespace but the port route is still settling; wait 1-2 minutes and retry, or open the panel and use option `6) Force Reconnect`.
+After the Worker starts the Codespace, it briefly probes the `app.github.dev` XHTTP route. If the response says `route_ready: true`, your existing VLESS configs should work again. If it says `route_ready: false` with HTTP `404`, GitHub has started the Codespace but the port route is still settling; wait 1-2 minutes and retry, or open the panel and use option `6) Recover Now`.
 
 Do not paste the GitHub token into G2ray. Create the token in GitHub, save it privately, and enter it directly in Cloudflare as the `GITHUB_TOKEN` secret. The wake secret is shown once by the panel; save it privately and enter it directly in Cloudflare as the `WAKE_SECRET` secret.
 
@@ -237,6 +265,8 @@ npx wrangler secret put WAKE_SECRET
 npx wrangler deploy
 ```
 
+After deploy, copy the Worker URL that Wrangler prints, return to panel option `15) Recovery / Waker Setup`, answer that the Worker is deployed, paste the Worker URL, and run the panel's Worker test. This saves only non-sensitive Worker metadata locally so diagnostics and the recovery card can show the configured Worker.
+
 Wake call:
 
 ```bash
@@ -246,6 +276,8 @@ unset WAKE_SECRET
 ```
 
 The browser form is preferred because it keeps the wake secret out of shell history. See `worker/codespace-waker/README.md` for the full setup and token guidance.
+
+If you create a new Codespace, change region, rename/recreate the Codespace, or change `XRAY_PORT`, update the Worker's `CODESPACE_NAME` and optional `CODESPACE_PORT` bindings, redeploy the Worker, then return to option `15` and save/test the Worker URL again.
 
 ---
 

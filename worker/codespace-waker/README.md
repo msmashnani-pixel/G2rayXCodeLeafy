@@ -2,11 +2,11 @@
 
 Educational use only: this helper is provided for learning and recovery experiments. Use it only in ways that comply with applicable laws, GitHub Codespaces policies, Cloudflare policies, and network rules.
 
-This Cloudflare Worker gives you a private manual `/wake` endpoint that starts one GitHub Codespace through GitHub's official Codespaces API.
+This Cloudflare Worker gives you a manual wake page for one GitHub Codespace through GitHub's official Codespaces API. The `GET /wake` page is public so it can load in your browser, but `POST /wake` and the `/api/*` actions require your wake secret.
 
 It does not keep the Codespace alive forever and it cannot bypass quota, billing, deletion, or account restrictions.
 
-The browser page is a small mobile-friendly health dashboard. It has a large **Start Codespace** button, a **Check Health** action, route latency/status cards, copyable status text, a stop-polling button, and auto-refresh while the route is still settling.
+The browser page is a small mobile-friendly health dashboard. It has a large **Start Codespace** button, a **Check Health** action, route latency/status cards, copyable status text, a stop-polling button, a route history summary, a latency trend, and auto-refresh while the route is still settling.
 
 After GitHub accepts the start request, the Worker waits for the Codespace state to become available, then probes the public `app.github.dev` XHTTP route. If the response says `route_ready: true`, the external route answered a usable XHTTP probe and the VLESS configs should usually be usable. If it says `route_ready: false`, follow the returned `next_action`; HTTP `404` usually means GitHub's port route is still settling, while HTTP `0` usually means DNS or the app route did not answer.
 
@@ -65,14 +65,14 @@ If you use the Cloudflare dashboard instead of Wrangler, add `CODESPACE_NAME` as
 
 Optional: add `CODESPACE_PORT` as a **Plaintext** variable only if you changed the panel's `XRAY_PORT`. Leave it unset for the default port `443`.
 
-Optional history: create a Cloudflare KV namespace and bind it as `WAKER_KV`. Without this binding, the dashboard still works but shows history as disabled.
+Optional history: create a Cloudflare KV namespace and bind it as `WAKER_KV`. Without this binding, the dashboard still works but shows history as disabled. With `WAKER_KV`, it stores recent wake/health events, route HTTP status, latency, route wait time, and last failures under a per-Codespace key so the dashboard can show repeated HTTP `404` settling and latency trends.
 
 Optional alerts:
 
 - Add `DISCORD_WEBHOOK_URL` as a **Secret** variable to notify a Discord channel.
 - Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as **Secret** variables to notify Telegram.
 
-Alerts are sent when a wake succeeds, when the route is ready, when the route remains stuck at HTTP `404`, and when GitHub rejects the token with `401` or `403`.
+Alerts are sent for wake attempts when a wake succeeds, when the route is ready, when the route remains stuck at HTTP `404`, and when GitHub rejects the token with `401` or `403`. Manual **Check Health** calls record history when KV is enabled, but they do not send route-ready or route-stuck alerts unless they reveal a token problem.
 
 ## 3. Add Secrets
 
@@ -114,6 +114,8 @@ https://g2ray-codespace-waker.YOUR_SUBDOMAIN.workers.dev
 
 The panel accepts the Worker URL with or without `https://`, and with or without `/wake`. It stores the normalized `/wake` URL.
 
+If you are using the G2ray panel, return to **Option 15: Recovery / Waker Setup** after deploy, paste this Worker URL, and run the panel's Worker test. This saves only non-sensitive Worker metadata locally so diagnostics and the recovery card know which Worker is configured.
+
 ## 5. Start The Codespace Manually
 
 Recommended CLI call:
@@ -128,6 +130,8 @@ unset WAKE_SECRET
 
 Opening the Worker URL in a browser and entering the wake secret in the form is preferred because it keeps the secret out of shell history.
 
+If you create a new Codespace, change region, rename/recreate the Codespace, or change the panel's `XRAY_PORT`, update `CODESPACE_NAME` and optional `CODESPACE_PORT`, redeploy the Worker, then return to panel option `15` and save/test the Worker URL again.
+
 ## Expected Responses
 
 - `200` with `ok: true`: GitHub accepted or handled the start request.
@@ -139,6 +143,7 @@ Opening the Worker URL in a browser and entering the wake secret in the form is 
 - `402`: GitHub quota or billing blocked the start. Wait for quota reset or adjust GitHub billing settings.
 - `403`: GitHub token is rejected, expired, or missing the right scope.
 - `404`: Codespace name is wrong or the token cannot access it.
+- `429`: Either too many wrong wake-secret attempts hit the optional KV-backed Worker rate limit, or GitHub rate-limited the token. Check `reason` and `retry_after_seconds`.
 
 ## Security Notes
 

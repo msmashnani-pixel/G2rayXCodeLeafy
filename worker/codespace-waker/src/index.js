@@ -8,9 +8,12 @@ const FETCH_TIMEOUT_MS = 10000;
 const ROUTE_FETCH_TIMEOUT_MS = 7000;
 const HISTORY_KEY_PREFIX = "history:";
 const HISTORY_LIMIT = 50;
+const FAILED_AUTH_KEY_PREFIX = "failed-auth:";
+const FAILED_AUTH_WINDOW_SECONDS = 600;
+const FAILED_AUTH_MAX_ATTEMPTS = 10;
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if ((url.pathname === "/" || url.pathname === "/wake") && request.method === "GET") {
@@ -18,11 +21,11 @@ export default {
     }
 
     if (url.pathname === "/api/wake" && request.method === "POST") {
-      return handleWake(request, env);
+      return handleWake(request, env, ctx);
     }
 
     if (url.pathname === "/api/health" && request.method === "POST") {
-      return handleHealth(request, env);
+      return handleHealth(request, env, ctx);
     }
 
     if (url.pathname === "/api/history" && request.method === "POST") {
@@ -30,7 +33,7 @@ export default {
     }
 
     if (url.pathname === "/wake" && request.method === "POST") {
-      return handleWake(request, env);
+      return handleWake(request, env, ctx);
     }
 
     if (url.pathname === "/wake" || url.pathname.startsWith("/api/")) {
@@ -41,11 +44,12 @@ export default {
   }
 };
 
-async function handleWake(request, env) {
+async function handleWake(request, env, ctx) {
   const context = await requireAuthorizedContext(request, env);
   if (!context.ok) return json(context.body, context.status);
 
   const data = await startCodespaceData(context.codespaceName, context.token, env);
+  data.next_action = data.next_action || nextActionForWake(data, data.route_probe || {});
   const event = eventFromResult("wake", context.codespaceName, data);
   const historyRecorded = await recordHistory(env, {
     ...event,
@@ -61,7 +65,7 @@ async function handleWake(request, env) {
   }, responseStatusFor(data));
 }
 
-async function handleHealth(request, env) {
+async function handleHealth(request, env, ctx) {
   const context = await requireAuthorizedContext(request, env);
   if (!context.ok) return json(context.body, context.status);
 
@@ -106,7 +110,9 @@ async function handleHistory(request, env) {
 async function requireAuthorizedContext(request, env) {
   const suppliedSecret = await readSuppliedSecret(request);
 
-  if (!env.WAKE_SECRET || suppliedSecret !== env.WAKE_SECRET) {
+  if (!env.WAKE_SECRET || !(await secretsEqual(suppliedSecret, env.WAKE_SECRET))) {
+    const limited = await rateLimitFailedAuth(request, env);
+    if (limited) return limited;
     return { ok: false, status: 401, body: { ok: false, error: "unauthorized" } };
   }
 
@@ -124,6 +130,57 @@ async function requireAuthorizedContext(request, env) {
     codespaceName,
     token: env.GITHUB_TOKEN
   };
+}
+
+async function rateLimitFailedAuth(request, env) {
+  if (!env.WAKER_KV) return null;
+  const key = failedAuthKey(request);
+  try {
+    const raw = await env.WAKER_KV.get(key);
+    const count = Number.parseInt(raw || "0", 10) || 0;
+    const next = count + 1;
+    await env.WAKER_KV.put(key, String(next), { expirationTtl: FAILED_AUTH_WINDOW_SECONDS });
+    if (next > FAILED_AUTH_MAX_ATTEMPTS) {
+      return {
+        ok: false,
+        status: 429,
+        body: {
+          ok: false,
+          error: "too_many_failed_wake_secret_attempts",
+          reason: "worker_wake_secret_rate_limited",
+          retry_after_seconds: FAILED_AUTH_WINDOW_SECONDS
+        }
+      };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function failedAuthKey(request) {
+  const ip = request.headers.get("cf-connecting-ip")
+    || request.headers.get("x-forwarded-for")
+    || "unknown";
+  return FAILED_AUTH_KEY_PREFIX + encodeURIComponent(String(ip).split(",")[0].trim() || "unknown");
+}
+
+async function secretsEqual(supplied, expected) {
+  if (!supplied || !expected) return false;
+  const left = await sha256Hex(String(supplied));
+  const right = await sha256Hex(String(expected));
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let i = 0; i < left.length; i += 1) {
+    diff |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function startCodespaceData(name, token, env) {
@@ -148,39 +205,8 @@ async function startCodespaceData(name, token, env) {
   const text = await res.text();
   const body = parseBody(text);
 
-  if (res.status === 402) {
-    return {
-      ok: false,
-      status: res.status,
-      codespace: name,
-      reason: "quota_or_billing_blocked",
-      detail: githubErrorDetail(body),
-      message: "GitHub quota or billing blocked the Codespace start request."
-    };
-  }
-
-  if (res.status === 401 || res.status === 403) {
-    return {
-      ok: false,
-      status: res.status,
-      codespace: name,
-      reason: "github_token_rejected_or_missing_scope",
-      detail: githubErrorDetail(body),
-      token_warning: "GitHub token rejected or expired",
-      message: "GitHub token rejected or expired. Rotate the token or add the codespace scope."
-    };
-  }
-
-  if (res.status === 404) {
-    return {
-      ok: false,
-      status: res.status,
-      codespace: name,
-      reason: "codespace_not_found_or_token_cannot_access_it",
-      detail: githubErrorDetail(body),
-      message: "Codespace not found, or the token cannot access it."
-    };
-  }
+  const githubFailure = githubFailureForResponse(res, body, name);
+  if (githubFailure) return githubFailure;
 
   const accepted = res.ok || res.status === 202 || res.status === 304 || res.status === 409;
   if (!accepted) {
@@ -215,7 +241,7 @@ async function startCodespaceData(name, token, env) {
     next_action: nextActionForWake(readyState, routeProbe),
     message: routeProbe.usable
       ? "Codespace start request accepted and the XHTTP route is usable."
-      : "Codespace start request accepted, but the XHTTP route is still settling. Wait and try again; if it stays 404, open the panel and use option 6."
+      : "Codespace start request accepted, but the XHTTP route is still settling. Wait and try again; if it stays 404, open the panel and use option 6 Recover Now."
   };
 }
 
@@ -280,17 +306,8 @@ async function getCodespaceStatus(codespaceName, token) {
 
   const body = parseBody(await res.text());
 
-  if (res.status === 401 || res.status === 403) {
-    return {
-      ok: false,
-      status: res.status,
-      codespace: codespaceName,
-      reason: "github_token_rejected_or_missing_scope",
-      detail: githubErrorDetail(body),
-      token_warning: "GitHub token rejected or expired",
-      message: "GitHub token rejected or expired. Rotate the token or add the codespace scope."
-    };
-  }
+  const githubFailure = githubFailureForResponse(res, body, codespaceName);
+  if (githubFailure) return githubFailure;
 
   if (!res.ok) {
     return {
@@ -318,6 +335,98 @@ async function getCodespaceStatus(codespaceName, token) {
   };
 }
 
+function githubFailureForResponse(res, body, codespaceName) {
+  if (res.status === 429) {
+    const rateReset = res.headers.get("x-ratelimit-reset");
+    const retryAfter = res.headers.get("retry-after");
+    return {
+      ok: false,
+      status: res.status,
+      codespace: codespaceName,
+      reason: "github_rate_limited",
+      detail: githubErrorDetail(body),
+      retry_after_seconds: retryAfter ? Number.parseInt(retryAfter, 10) || null : null,
+      retry_after_epoch: rateReset ? Number.parseInt(rateReset, 10) || null : null,
+      message: "GitHub API rate limit reached. Wait for the reset window, then try again."
+    };
+  }
+
+  if (res.status === 402) {
+    return {
+      ok: false,
+      status: res.status,
+      codespace: codespaceName,
+      reason: "quota_or_billing_blocked",
+      detail: githubErrorDetail(body),
+      message: "GitHub quota or billing blocked the Codespace start request."
+    };
+  }
+
+  if (res.status === 401) {
+    return {
+      ok: false,
+      status: res.status,
+      codespace: codespaceName,
+      reason: "github_token_rejected_or_missing_scope",
+      detail: githubErrorDetail(body),
+      token_warning: "GitHub token rejected or expired",
+      message: "GitHub token rejected or expired. Rotate the token or add the codespace scope."
+    };
+  }
+
+  if (res.status === 403) {
+    const rateRemaining = res.headers.get("x-ratelimit-remaining");
+    const rateReset = res.headers.get("x-ratelimit-reset");
+    const retryAfter = res.headers.get("retry-after");
+    const message = String(body && typeof body === "object" ? body.message || "" : body || "").toLowerCase();
+    if (rateRemaining === "0") {
+      return {
+        ok: false,
+        status: 429,
+        codespace: codespaceName,
+        reason: "github_rate_limited",
+        detail: githubErrorDetail(body),
+        retry_after_seconds: retryAfter ? Number.parseInt(retryAfter, 10) || null : null,
+        retry_after_epoch: rateReset ? Number.parseInt(rateReset, 10) || null : null,
+        message: "GitHub API rate limit reached. Wait for the reset window, then try again."
+      };
+    }
+    if (retryAfter || message.includes("secondary rate limit") || message.includes("abuse detection")) {
+      return {
+        ok: false,
+        status: 429,
+        codespace: codespaceName,
+        reason: "github_secondary_rate_limited",
+        detail: githubErrorDetail(body),
+        retry_after_seconds: retryAfter ? Number.parseInt(retryAfter, 10) || null : null,
+        message: "GitHub temporarily throttled this token. Wait, then try again."
+      };
+    }
+    return {
+      ok: false,
+      status: res.status,
+      codespace: codespaceName,
+      reason: "github_token_rejected_or_missing_scope",
+      detail: githubErrorDetail(body),
+      token_warning: "GitHub token rejected or expired",
+      message: "GitHub token rejected or expired. Rotate the token or add the codespace scope."
+    };
+  }
+
+  if (res.status === 404) {
+    return {
+      ok: false,
+      status: res.status,
+      codespace: codespaceName,
+      reason: "codespace_not_found_or_token_cannot_access_it",
+      detail: githubErrorDetail(body),
+      message: "Codespace not found, or the token cannot access it."
+    };
+  }
+
+  return null;
+}
+
 function githubHeaders(token) {
   return {
     accept: "application/vnd.github+json",
@@ -330,7 +439,7 @@ function githubHeaders(token) {
 function responseStatusFor(data) {
   if (data.ok && data.start_accepted && data.route_ready === false && isRouteSettlingStatus(data.route_probe)) return 202;
   if (data.ok) return 200;
-  if ([401, 402, 403, 404].includes(data.status)) return data.status;
+  if ([401, 402, 403, 404, 429].includes(data.status)) return data.status;
   return 502;
 }
 
@@ -350,12 +459,18 @@ function isCodespaceAvailable(status) {
 }
 
 function nextActionForWake(status, routeProbe) {
+  if (status.reason === "github_rate_limited" || status.reason === "github_secondary_rate_limited") {
+    return "GitHub is throttling this token. Wait for the retry/reset window, then press Check Health or Start Codespace again.";
+  }
+  if (status.reason === "github_token_rejected_or_missing_scope") {
+    return "Rotate the GitHub token and make sure it has the codespace scope.";
+  }
   if (!status.ok) return "Open GitHub Codespaces or rotate the GitHub token, then try the Worker again.";
   if (!isCodespaceAvailable(status)) return "Wait for GitHub to finish starting the Codespace, then press Check Health.";
   if (routeProbe.usable) return "Try the same VLESS config again.";
-  if (routeProbe.http_status === 404) return "Open the panel, check option 14 Diagnostics, then use option 6 Force Reconnect if the route stays 404.";
+  if (routeProbe.http_status === 404) return "Open the panel, check option 14 Diagnostics, then use option 6 Recover Now if the route stays 404.";
   if (routeProbe.http_status === 0) return "The app.github.dev route did not resolve or answer. Open the Codespace once, then check port 443 visibility and panel diagnostics.";
-  return "Check panel option 14 Diagnostics; if XHTTP is not usable, use option 6 Force Reconnect.";
+  return "Check panel option 14 Diagnostics; if XHTTP is not usable, use option 6 Recover Now.";
 }
 
 function healthMessage(status, routeProbe) {
@@ -382,6 +497,8 @@ function eventFromResult(kind, codespace, data) {
     route_ready: data.route_ready === true,
     route_http_status: data.route_probe ? data.route_probe.http_status : null,
     route_latency_ms: data.route_probe ? data.route_probe.latency_ms : null,
+    route_waited_ms: data.route_probe ? data.route_probe.waited_ms : null,
+    route_attempts: data.route_probe ? data.route_probe.attempts : null,
     reason: data.reason || null,
     token_warning: data.token_warning || null,
     message: data.message || null
@@ -671,6 +788,7 @@ function renderDashboard() {
   }
   h1 { margin: 0 0 6px; font-size: 30px; letter-spacing: 0; }
   h2 { margin: 0 0 12px; font-size: 18px; letter-spacing: 0; }
+  h3 { margin: 16px 0 10px; font-size: 15px; letter-spacing: 0; }
   p { margin: 0 0 14px; color: var(--muted); }
   .card {
     background: var(--panel);
@@ -745,6 +863,25 @@ function renderDashboard() {
     padding: 10px;
     color: var(--muted);
   }
+  .trend-row {
+    display: grid;
+    grid-template-columns: 130px 1fr 72px;
+    align-items: center;
+    gap: 10px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .trend-track {
+    height: 10px;
+    border-radius: 999px;
+    background: #0b0d0f;
+    overflow: hidden;
+  }
+  .trend-bar {
+    height: 100%;
+    min-width: 2px;
+    background: var(--accent);
+  }
   @media (max-width: 640px) {
     main { padding: 14px; }
     h1 { font-size: 25px; }
@@ -799,6 +936,18 @@ function renderDashboard() {
   <section class="card">
     <h2>History</h2>
     <p id="historyNote">History appears when WAKER_KV is configured.</p>
+    <h3>Route history summary</h3>
+    <div id="historySummary" class="grid">
+      <div class="metric"><span>Samples</span><strong>Not loaded</strong></div>
+      <div class="metric"><span>Route ready</span><strong>Not loaded</strong></div>
+      <div class="metric"><span>HTTP 404</span><strong>Not loaded</strong></div>
+      <div class="metric"><span>Wake success</span><strong>Not loaded</strong></div>
+      <div class="metric"><span>Best latency</span><strong>Not loaded</strong></div>
+      <div class="metric"><span>Last stuck route</span><strong>Not loaded</strong></div>
+    </div>
+    <h3>Latency trend</h3>
+    <div id="latencyTrend" class="history"></div>
+    <h3>Recent events</h3>
     <div id="historyList" class="history"></div>
   </section>
 </main>
@@ -809,6 +958,8 @@ const resultEl = document.getElementById("result");
 const progressEl = document.getElementById("progress");
 const historyList = document.getElementById("historyList");
 const historyNote = document.getElementById("historyNote");
+const historySummary = document.getElementById("historySummary");
+const latencyTrend = document.getElementById("latencyTrend");
 let lastStatusText = "";
 let polling = false;
 let pollTimer = null;
@@ -973,10 +1124,24 @@ function routeSettlingFailureText(data, route, routeReady) {
 
 function renderHistory(data) {
   historyList.innerHTML = "";
+  latencyTrend.innerHTML = "";
+  if (data && data.ok === false) {
+    const message = data.reason || data.error || (data.status ? "HTTP " + data.status : "history_request_failed");
+    historyNote.textContent = "History request failed: " + message;
+    const item = document.createElement("div");
+    item.className = "event";
+    item.textContent = data.message || data.token_warning || message;
+    historyList.appendChild(item);
+    resultEl.textContent = JSON.stringify(data, null, 2);
+    return;
+  }
   historyNote.textContent = data.history_enabled
     ? "Recent wake and health events."
     : "History is disabled because WAKER_KV is not configured.";
-  for (const event of data.history || []) {
+  const events = data.history || [];
+  renderHistorySummary(events);
+  renderLatencyTrend(events);
+  for (const event of events) {
     const item = document.createElement("div");
     item.className = "event";
     item.textContent = [
@@ -985,10 +1150,104 @@ function renderHistory(data) {
       "ok=" + event.ok,
       "route_ready=" + event.route_ready,
       "http=" + (event.route_http_status || "unknown"),
+      "latency=" + (event.route_latency_ms == null ? "unknown" : event.route_latency_ms + "ms"),
+      "waited=" + (event.route_waited_ms == null ? "unknown" : event.route_waited_ms + "ms"),
       event.reason || ""
     ].filter(Boolean).join(" | ");
     historyList.appendChild(item);
   }
+}
+
+function renderHistorySummary(events) {
+  const summary = summarizeHistory(events);
+  historySummary.innerHTML = "";
+  const cards = [
+    ["Samples", String(summary.samples)],
+    ["Route ready", summary.ready + " / " + summary.samples],
+    ["HTTP 404", String(summary.http404)],
+    ["Wake success", summary.wakeOk + " ok / " + summary.wakeFail + " fail"],
+    ["Best latency", summary.bestLatency == null ? "None" : summary.bestLatency + "ms"],
+    ["Last stuck route", summary.lastStuck || "None seen"]
+  ];
+  for (const [label, value] of cards) {
+    const card = document.createElement("div");
+    card.className = "metric";
+    const span = document.createElement("span");
+    span.textContent = label;
+    const strong = document.createElement("strong");
+    strong.textContent = value;
+    card.appendChild(span);
+    card.appendChild(strong);
+    historySummary.appendChild(card);
+  }
+}
+
+function summarizeHistory(events) {
+  const summary = {
+    samples: events.length,
+    ready: 0,
+    http404: 0,
+    wakeOk: 0,
+    wakeFail: 0,
+    bestLatency: null,
+    lastStuck: ""
+  };
+  for (const event of events) {
+    if (event.route_ready === true) summary.ready += 1;
+    if (event.route_http_status === 404) summary.http404 += 1;
+    if (event.kind === "wake" && event.ok) summary.wakeOk += 1;
+    if (event.kind === "wake" && !event.ok) summary.wakeFail += 1;
+    if (Number.isFinite(event.route_latency_ms)) {
+      summary.bestLatency = summary.bestLatency == null
+        ? event.route_latency_ms
+        : Math.min(summary.bestLatency, event.route_latency_ms);
+    }
+    if (!summary.lastStuck && event.route_ready !== true && (event.route_http_status === 404 || event.route_http_status === 0)) {
+      const waited = event.route_waited_ms == null ? "" : ", waited " + event.route_waited_ms + "ms";
+      summary.lastStuck = (event.ts || "unknown time") + " HTTP " + (event.route_http_status || 0) + waited;
+    }
+  }
+  return summary;
+}
+
+function renderLatencyTrend(events) {
+  const latencyEvents = events
+    .filter((event) => Number.isFinite(event.route_latency_ms))
+    .slice(0, 12)
+    .reverse();
+  if (latencyEvents.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "event";
+    empty.textContent = "No latency samples yet.";
+    latencyTrend.appendChild(empty);
+    return;
+  }
+  const max = Math.max(...latencyEvents.map((event) => event.route_latency_ms), 1);
+  for (const event of latencyEvents) {
+    const row = document.createElement("div");
+    row.className = "trend-row";
+    const label = document.createElement("span");
+    label.textContent = shortTime(event.ts);
+    const track = document.createElement("div");
+    track.className = "trend-track";
+    const bar = document.createElement("div");
+    bar.className = "trend-bar";
+    bar.style.width = Math.max(4, Math.round((event.route_latency_ms / max) * 100)) + "%";
+    track.appendChild(bar);
+    const value = document.createElement("span");
+    value.textContent = event.route_latency_ms + "ms";
+    row.appendChild(label);
+    row.appendChild(track);
+    row.appendChild(value);
+    latencyTrend.appendChild(row);
+  }
+}
+
+function shortTime(value) {
+  if (!value) return "unknown";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 16);
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function renderError(error) {

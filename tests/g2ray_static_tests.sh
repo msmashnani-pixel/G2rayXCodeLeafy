@@ -53,6 +53,8 @@ test_process_management_uses_pid_file() {
         || fail 'stop/status paths do not validate PID ownership before trusting the PID file'
     grep_fixed 'owned_xray_pids()' "$SCRIPT" \
         || fail 'script does not enumerate all owned Xray processes'
+    grep_fixed 'xpid=$(owned_xray_pids | head -1 || true)' "$SCRIPT" \
+        || fail 'resource stats do not prefer project-owned Xray PIDs'
     grep_fixed 'mapfile -t owned_pids' "$SCRIPT" \
         || fail 'stop_xray does not collect every owned Xray PID before stopping'
     grep_fixed 'for p in "${owned_pids[@]}"' "$SCRIPT" \
@@ -63,6 +65,9 @@ test_process_management_uses_pid_file() {
         || fail 'start_xray does not store the launched Xray PID'
     if grep_fixed 'pkill -x "xray"' "$SCRIPT" || grep_fixed 'pkill -9 -x "xray"' "$SCRIPT"; then
         fail 'script still kills every process named xray'
+    fi
+    if grep_fixed 'pgrep -x "xray"' "$SCRIPT"; then
+        fail 'script still trusts a broad xray process lookup'
     fi
     pass 'process management is scoped through a PID file'
 }
@@ -662,6 +667,14 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker dashboard can still report no failure while the route is settling'
     grep_fixed 'data.start_accepted && data.route_ready === false && isRouteSettlingStatus(data.route_probe)' "$WORKER_SCRIPT" \
         || fail 'Worker HTTP status does not distinguish accepted-but-route-settling responses'
+    grep_fixed 'Route history summary' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not summarize route health history'
+    grep_fixed 'latencyTrend' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not render a latency trend'
+    grep_fixed 'renderHistorySummary' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not compute history summary metrics'
+    grep_fixed 'History request failed:' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard hides unauthorized or failed history requests'
     grep_fixed 'WAKER_KV' "$WORKER_README" \
         || fail 'Worker README does not document optional KV history'
     grep_fixed 'DISCORD_WEBHOOK_URL' "$WORKER_README" \
@@ -701,6 +714,26 @@ test_worker_wake_edge_cases_are_hardened() {
     pass 'Worker wake edge cases are hardened'
 }
 
+test_worker_rate_limits_and_classifies_github_errors() {
+    grep_fixed 'rateLimitFailedAuth(request, env)' "$WORKER_SCRIPT" \
+        || fail 'Worker does not rate-limit failed wake-secret attempts'
+    grep_fixed 'githubFailureForResponse(res, body, codespaceName)' "$WORKER_SCRIPT" \
+        || fail 'Worker does not centralize GitHub error classification'
+    grep_fixed 'github_rate_limited' "$WORKER_SCRIPT" \
+        || fail 'Worker does not distinguish GitHub rate limit failures'
+    grep_fixed 'res.status === 429' "$WORKER_SCRIPT" \
+        || fail 'Worker does not classify direct GitHub HTTP 429 failures'
+    grep_fixed 'github_secondary_rate_limited' "$WORKER_SCRIPT" \
+        || fail 'Worker does not distinguish secondary rate limits'
+    grep_fixed 'status: 429' "$WORKER_SCRIPT" \
+        || fail 'Worker does not return 429 for rate-limit conditions'
+    grep_fixed 'data.next_action = data.next_action || nextActionForWake(data, data.route_probe || {})' "$WORKER_SCRIPT" \
+        || fail 'Worker wake failures do not include next_action guidance'
+    grep_fixed 'FAILED_AUTH_KEY_PREFIX' "$WORKER_SCRIPT" \
+        || fail 'Worker failed-auth rate limit is not persisted in KV'
+    pass 'Worker rate-limits bad secrets and classifies GitHub failures'
+}
+
 test_route_candidate_monitor_is_bounded() {
     grep_fixed 'ROUTE_HEALTH_FILE=' "$SCRIPT" \
         || fail 'route candidate monitor has no bounded health cache file'
@@ -722,6 +755,120 @@ test_route_candidate_monitor_is_bounded() {
     pass 'route candidate monitor is bounded and diagnostics-visible'
 }
 
+test_route_candidate_manager_and_live_monitor_are_present() {
+    grep_fixed 'MANUAL_ROUTE_CANDIDATES_FILE=' "$SCRIPT" \
+        || fail 'manual route candidate file is not defined'
+    grep_fixed 'BLACKLISTED_ROUTE_CANDIDATES_FILE=' "$SCRIPT" \
+        || fail 'blacklisted route candidate file is not defined'
+    grep_fixed 'PINNED_ROUTE_FILE=' "$SCRIPT" \
+        || fail 'pinned route file is not defined'
+    grep_fixed 'valid_ipv4()' "$SCRIPT" \
+        || fail 'route manager has no IPv4 validator'
+    grep_fixed 'add_manual_route_candidate()' "$SCRIPT" \
+        || fail 'route manager cannot add manual IPv4 candidates'
+    grep_fixed 'blacklist_route_candidate()' "$SCRIPT" \
+        || fail 'route manager cannot blacklist bad routes'
+    grep_fixed 'pin_route_candidate()' "$SCRIPT" \
+        || fail 'route manager cannot pin a preferred route'
+    grep_fixed 'reset_route_candidate_cache()' "$SCRIPT" \
+        || fail 'route manager cannot reset measured route health without wiping preferences'
+    grep_fixed 'reset_route_candidate_state()' "$SCRIPT" \
+        || fail 'route manager cannot reset all route preferences'
+    grep_fixed 'Reset Route Health Cache' "$SCRIPT" \
+        || fail 'route manager UI does not distinguish cache reset from preference reset'
+    grep_fixed 'Reset All Route Preferences' "$SCRIPT" \
+        || fail 'route manager UI does not expose an explicit full preference reset'
+    grep_fixed 'show_route_candidate_manager()' "$SCRIPT" \
+        || fail 'route candidate manager screen is missing'
+    grep_fixed 'show_live_monitor()' "$SCRIPT" \
+        || fail 'live monitor screen is missing'
+    grep_fixed '16)${NC} Live Monitor' "$SCRIPT" \
+        || fail 'main menu does not expose live monitor'
+    grep_fixed '17)${NC} Route Candidates' "$SCRIPT" \
+        || fail 'main menu does not expose route candidates manager'
+    grep_fixed '16) show_live_monitor' "$SCRIPT" \
+        || fail 'case statement does not route to live monitor'
+    grep_fixed '17) show_route_candidate_manager' "$SCRIPT" \
+        || fail 'case statement does not route to route candidate manager'
+    grep_fixed 'pinned_route_value' "$SCRIPT" \
+        || fail 'cached route ordering does not consider pinned routes'
+    grep_fixed 'while IFS= read -r ip; do' "$SCRIPT" \
+        || fail 'resolver does not include persisted pinned/manual route candidates'
+    grep_fixed 'append_unique_route "$MANUAL_ROUTE_CANDIDATES_FILE" "$ip" || return 1' "$SCRIPT" \
+        || fail 'manual route additions do not report persistence failures'
+    grep_fixed '_atomic_write "$PINNED_ROUTE_FILE" "$ip" || return 1' "$SCRIPT" \
+        || fail 'pinned routes do not report persistence failures'
+    grep_fixed 'append_unique_route "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$ip" || return 1' "$SCRIPT" \
+        || fail 'blacklisted route additions do not report persistence failures'
+    grep_fixed 'remove_route_from_file "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$ip" || return 1' "$SCRIPT" \
+        || fail 'unblacklist does not report no-op or persistence failures'
+    grep_fixed 'candidate_blacklisted "$ip"' "$SCRIPT" \
+        || fail 'route exports do not filter blacklisted routes'
+    grep_fixed 'Route Candidates' "$README" \
+        || fail 'README does not document route candidate manager'
+    pass 'route candidate manager and live monitor are present'
+}
+
+test_first_run_recovery_card_is_present() {
+    grep_fixed 'show_recovery_command_card()' "$SCRIPT" \
+        || fail 'first-run recovery command card helper is missing'
+    grep_fixed 'bash ./g2ray.sh --doctor-json' "$SCRIPT" \
+        || fail 'recovery command card does not show doctor JSON command'
+    grep_fixed 'bash ./g2ray.sh --recover-now' "$SCRIPT" \
+        || fail 'recovery command card does not show recover command'
+    grep_fixed 'replace <WAKE_SECRET>' "$SCRIPT" \
+        || fail 'recovery command card does not avoid printing the raw wake secret'
+    grep_fixed 'copy these recovery commands' "$README" \
+        || fail 'README does not mention the recovery command card'
+    pass 'first-run recovery card is present'
+}
+
+test_soft_recovery_and_route_memory_are_present() {
+    grep_fixed 'recover_now()' "$SCRIPT" \
+        || fail 'panel has no idempotent soft recovery path'
+    grep_fixed 'recover_now --no-prompt' "$SCRIPT" \
+        || fail 'headless recover command is not wired'
+    grep_fixed '--doctor-json' "$SCRIPT" \
+        || fail 'panel has no headless doctor JSON command'
+    grep_fixed 'print_doctor_json()' "$SCRIPT" \
+        || fail 'doctor JSON renderer is missing'
+    grep_fixed 'doctor_port=443' "$SCRIPT" \
+        || fail 'doctor JSON does not sanitize invalid port values'
+    grep_fixed 'ensure_codespace_port_public force' "$SCRIPT" \
+        || fail 'hard repair paths cannot bypass port-public throttling'
+    grep_fixed 'PORT_PUBLIC_STAMP_FILE=' "$SCRIPT" \
+        || fail 'port visibility calls are not timestamp-throttled'
+    grep_fixed 'PORT_PUBLIC_STAMP_FILE}.${CODESPACE_NAME}.${XRAY_PORT}' "$SCRIPT" \
+        || fail 'port visibility cache is not scoped by codespace and port'
+    grep_fixed 'LAST_GOOD_ROUTE_FILE=' "$SCRIPT" \
+        || fail 'last-good route is not persisted'
+    grep_fixed 'save_last_good_route()' "$SCRIPT" \
+        || fail 'last-good route save helper is missing'
+    grep_fixed 'cached_usable_fallback_ips()' "$SCRIPT" \
+        || fail 'exports cannot use cached route health'
+    grep_fixed 'route_health_cache_fresh()' "$SCRIPT" \
+        || fail 'route health cache has no freshness guard'
+    grep_fixed 'Route Settling History' "$SCRIPT" \
+        || fail 'diagnostics do not expose route-settling history'
+    grep_fixed 'record_route_settling_metric "$reason" "ready"' "$SCRIPT" \
+        || fail 'route wait does not record ready timing'
+    grep_fixed 'attempt=$(( attempt + 1 ))' "$SCRIPT" \
+        || fail 'route wait does not count the first probe attempt'
+    grep_fixed 'record_route_settling_metric "$reason" "timeout"' "$SCRIPT" \
+        || fail 'route wait does not record timeout timing'
+    grep_fixed 'STRUCTURED_LOG_FILE=' "$SCRIPT" \
+        || fail 'structured persistent log file is not defined'
+    grep_fixed 'DIAGNOSTIC_LOG_FILE=' "$SCRIPT" \
+        || fail 'readable persistent diagnostic log file is not defined'
+    grep_fixed '>> "$DIAGNOSTIC_LOG_FILE"' "$SCRIPT" \
+        || fail 'diagnostic snapshots are not written to the diagnostic log'
+    grep_fixed 'log_diagnostic_snapshot "interactive"' "$SCRIPT" \
+        || fail 'diagnostics do not write a persistent snapshot'
+    grep_fixed '6) recover_now' "$SCRIPT" \
+        || fail 'menu option 6 does not use soft recovery first'
+    pass 'soft recovery, route memory, headless status, and persistent logs are present'
+}
+
 test_route_export_and_reconnect_edges_are_hardened() {
     if grep_fixed 'fallback_route_filter no-usable-probes action=export-candidates' "$SCRIPT"; then
         fail 'fallback exports still emit candidates after all route probes failed'
@@ -737,6 +884,8 @@ test_route_export_and_reconnect_edges_are_hardened() {
         || fail 'new config generation does not refresh exported config files'
     grep_fixed 'FORCE_RECONNECT_ROUTE_WAIT_SEC' "$SCRIPT" \
         || fail 'force reconnect has no dedicated route-settling wait budget'
+    grep_fixed 'XRAY_PORT=443' "$SCRIPT" \
+        || fail 'invalid XRAY_PORT input is not sanitized to 443'
     grep_fixed 'wait_for_xhttp_route_ready "force_reconnect" "$FORCE_RECONNECT_ROUTE_WAIT_SEC"' "$SCRIPT" \
         || fail 'force reconnect does not reuse the route-settling wait loop'
     grep_fixed 'local no_prompt="${1:-}" failed=0 expose_failed=false hard_failed=false' "$SCRIPT" \
@@ -813,6 +962,10 @@ test_panel_guides_cloudflare_waker_setup() {
         || fail 'wizard does not recommend the 240 minute idle timeout'
     grep_fixed 'Authorization: Bearer' "$SCRIPT" \
         || fail 'wizard/test flow does not use the safer bearer secret form'
+    grep_fixed 'WAKER_TEST_TIMEOUT_SEC' "$SCRIPT" \
+        || fail 'panel Worker test timeout is not configurable for long wake waits'
+    grep_fixed 'curl -sS -m "$WAKER_TEST_TIMEOUT_SEC"' "$SCRIPT" \
+        || fail 'panel Worker test still uses a fixed short curl timeout'
     grep_fixed 'fingerprint_secret "$wake_secret"' "$SCRIPT" \
         || fail 'wizard does not store only a fingerprint of the wake secret'
     if grep_fixed 'GITHUB_TOKEN=' "$SCRIPT"; then
@@ -846,6 +999,8 @@ test_diagnostics_show_external_waker_state() {
 test_docs_cover_panel_waker_setup() {
     grep_fixed 'Option 15' "$README" \
         || fail 'README does not document the panel recovery setup option'
+    grep_fixed 'choose `1) Generate Config & Start`' "$README" \
+        || fail 'README fresh-start flow does not tell users which panel option to choose'
     grep_fixed 'Do not paste the GitHub token into G2ray' "$README" \
         || fail 'README does not warn against storing GitHub tokens in the panel'
     grep_fixed 'The wake secret is shown once' "$README" \
@@ -856,6 +1011,20 @@ test_docs_cover_panel_waker_setup() {
         || fail 'README does not connect recovery setup to the 240 minute idle timeout'
     grep_fixed 'Recovery / Waker Setup' "$WORKER_README" \
         || fail 'Worker README does not mention the panel setup flow'
+    grep_fixed 'GET /wake` page is public' "$README" \
+        || fail 'README does not clarify that the Worker page is public but actions are protected'
+    grep_fixed 'GET /wake` page is public' "$WORKER_README" \
+        || fail 'Worker README does not clarify that the page is public but actions are protected'
+    grep_fixed 'return to panel option `15) Recovery / Waker Setup`' "$README" \
+        || fail 'README does not tell users to return to option 15 after Worker deployment'
+    grep_fixed 'return to **Option 15: Recovery / Waker Setup** after deploy' "$WORKER_README" \
+        || fail 'Worker README does not tell users to return to option 15 after deploy'
+    grep_fixed 'bash ./g2ray.sh --silent-start' "$README" \
+        || fail 'README does not document the post-pull runtime refresh command'
+    grep_fixed '`--recover-now` is non-interactive and soft-only' "$README" \
+        || fail 'README does not clarify headless recover limitations'
+    grep_fixed 'wake attempts' "$WORKER_README" \
+        || fail 'Worker README overstates or omits alert trigger scope'
     grep_fixed 'Do not paste the GitHub token into G2ray' "$WORKER_README" \
         || fail 'Worker README does not mirror the token handling warning'
     grep_fixed 'read -rsp "Wake secret: " WAKE_SECRET' "$README" \
@@ -946,6 +1115,10 @@ test_runtime_ready_rejects_started_but_unusable_route() {
 test_runtime_files_are_private_and_tempfiles_are_unique() {
     grep_fixed 'umask 077' "$SCRIPT" \
         || fail 'runtime files are not created with a private umask'
+    grep_fixed 'DATA_DIR="${G2RAY_DATA_DIR:-$BASE_DIR/data}"' "$SCRIPT" \
+        || fail 'data dir cannot be redirected for hermetic behavior tests'
+    grep_fixed 'LOG_DIR="${G2RAY_LOG_DIR:-$BASE_DIR/logs}"' "$SCRIPT" \
+        || fail 'log dir cannot be redirected for hermetic behavior tests'
     grep_fixed 'chmod 600 "$UUID_FILE" "$CONFIG_FILE"' "$SCRIPT" \
         || fail 'generated UUID/config files are not explicitly chmod 600'
     if grep_fixed 'local tmp="/tmp/g2ray_remote.sh"' "$SCRIPT"; then
@@ -1004,9 +1177,13 @@ test_ci_runs_static_regressions() {
         || fail 'CI workflow does not syntax-check g2ray.sh'
     grep_fixed 'bash ./tests/g2ray_static_tests.sh' "$CI_WORKFLOW" \
         || fail 'CI workflow does not run the static regression suite'
+    grep_fixed 'bash ./tests/g2ray_behavior_tests.sh' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not run the behavior regression suite'
+    grep_fixed 'node ./tests/worker_behavior_tests.mjs' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not run the Worker behavior suite'
     grep_fixed 'LC_ALL: C.UTF-8' "$CI_WORKFLOW" \
         || fail 'CI workflow does not pin a UTF-8 locale for README/static text checks'
-    pass 'CI runs shell syntax and static regression checks'
+    pass 'CI runs shell syntax, static regressions, panel behavior, and Worker behavior regressions'
 }
 
 test_xhttp_route_settling_is_observable() {
@@ -1038,7 +1215,7 @@ test_xhttp_route_settling_is_observable() {
 }
 
 test_docs_and_public_configs_are_consistent() {
-    grep_fixed '1-to-15' "$README" \
+    grep_fixed '1-to-17' "$README" \
         || fail 'README menu count is stale'
     if grep_fixed 'did now get shown' "$README"; then
         fail 'README still contains the "did now" typo'
@@ -1170,7 +1347,11 @@ test_local_reopen_helper_is_documented
 test_cloudflare_worker_waker_is_safe_to_publish
 test_worker_dashboard_and_history_features
 test_worker_wake_edge_cases_are_hardened
+test_worker_rate_limits_and_classifies_github_errors
 test_route_candidate_monitor_is_bounded
+test_route_candidate_manager_and_live_monitor_are_present
+test_first_run_recovery_card_is_present
+test_soft_recovery_and_route_memory_are_present
 test_route_export_and_reconnect_edges_are_hardened
 test_panel_guides_cloudflare_waker_setup
 test_diagnostics_show_external_waker_state

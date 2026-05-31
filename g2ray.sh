@@ -10,7 +10,7 @@ RAW_BASE_URL="${G2RAY_RAW_BASE_URL:-https://raw.githubusercontent.com/${PROJECT_
 GREEN='\033[1;32m'; WHITE='\033[1;37m'; RED='\033[1;31m'
 YELLOW='\033[1;33m'; DIM='\033[2m'; NC='\033[0m'; B='\033[1m'
 
-DATA_DIR="$BASE_DIR/data"
+DATA_DIR="${G2RAY_DATA_DIR:-$BASE_DIR/data}"
 CONFIG_FILE="$DATA_DIR/config.json"
 UUID_FILE="$DATA_DIR/uuid.txt"
 BG_TASKS_PID="$DATA_DIR/bg_tasks.pid"
@@ -26,19 +26,28 @@ ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
 EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
 EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
 ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
+LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
+PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
+MANUAL_ROUTE_CANDIDATES_FILE="$DATA_DIR/manual_route_candidates.txt"
+BLACKLISTED_ROUTE_CANDIDATES_FILE="$DATA_DIR/blacklisted_route_candidates.txt"
+ROUTE_SETTLING_HISTORY_FILE="$DATA_DIR/route_settling_history.tsv"
+PORT_PUBLIC_STAMP_FILE="$DATA_DIR/port_public_last"
 QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
 XRAY_PID_FILE="$DATA_DIR/xray.pid"
 SAVED_BYTES_FILE="$DATA_DIR/saved_bytes.json"
 SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
 TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
 SESSION_START_FILE="$DATA_DIR/session_start.txt"
-LOG_DIR="$BASE_DIR/logs"
+LOG_DIR="${G2RAY_LOG_DIR:-$BASE_DIR/logs}"
 LOG_FILE="$LOG_DIR/g2ray.log"
+STRUCTURED_LOG_FILE="$LOG_DIR/g2ray-events.jsonl"
+DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
 QR_DIR="$DATA_DIR/qr"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT="${XRAY_PORT:-443}"
+[[ "$XRAY_PORT" =~ ^[0-9]+$ && "$XRAY_PORT" -gt 0 && "$XRAY_PORT" -le 65535 ]] || XRAY_PORT=443
 CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.85.77.48 20.207.70.99 20.120.56.11}"
 MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-3}"
@@ -48,18 +57,40 @@ SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
 ROUTE_WAIT_SEC="${G2RAY_ROUTE_WAIT_SEC:-120}"
 FORCE_RECONNECT_ROUTE_WAIT_SEC="${G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC:-60}"
+ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
+PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-60}"
+WAKER_TEST_TIMEOUT_SEC="${G2RAY_WAKER_TEST_TIMEOUT_SEC:-180}"
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
+[[ "$WAKER_TEST_TIMEOUT_SEC" =~ ^[0-9]+$ && "$WAKER_TEST_TIMEOUT_SEC" -ge 30 ]] || WAKER_TEST_TIMEOUT_SEC=180
 
 umask 077
 mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
 chmod 700 "$DATA_DIR" "$LOG_DIR" "$QR_DIR" 2>/dev/null || true
 touch "$LOG_FILE" 2>/dev/null || true
+touch "$STRUCTURED_LOG_FILE" 2>/dev/null || true
+touch "$DIAGNOSTIC_LOG_FILE" 2>/dev/null || true
 [[ -f "$SAVED_BYTES_FILE"   ]] || printf '{"down":0,"up":0}\n' > "$SAVED_BYTES_FILE"
 [[ -f "$SESSION_BYTES_FILE" ]] || printf '{"down":0,"up":0}\n' > "$SESSION_BYTES_FILE"
 [[ -f "$TOTAL_UPTIME_FILE"  ]] || printf '0\n'                 > "$TOTAL_UPTIME_FILE"
 [[ -f "$SESSION_START_FILE" ]] || date +%s                     > "$SESSION_START_FILE"
-chmod 600 "$LOG_FILE" "$SAVED_BYTES_FILE" "$SESSION_BYTES_FILE" "$TOTAL_UPTIME_FILE" "$SESSION_START_FILE" 2>/dev/null || true
+chmod 600 "$LOG_FILE" "$STRUCTURED_LOG_FILE" "$DIAGNOSTIC_LOG_FILE" "$SAVED_BYTES_FILE" "$SESSION_BYTES_FILE" "$TOTAL_UPTIME_FILE" "$SESSION_START_FILE" 2>/dev/null || true
+
+json_escape() {
+    printf '%s' "${1:-}" \
+        | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' \
+        | tr -d '\r\n'
+}
+
+log_structured_event() {
+    local ts="$1" level="$2" msg="$3" event
+    event=$(printf '%s' "$msg" | awk '{print $1; exit}' | tr -cd 'A-Za-z0-9_.:-')
+    [[ -n "$event" ]] || event="event"
+    rotate_log_file "$STRUCTURED_LOG_FILE"
+    printf '{"ts":"%s","level":"%s","event":"%s","message":"%s"}\n' \
+        "$(json_escape "$ts")" "$(json_escape "$level")" "$(json_escape "$event")" "$(json_escape "$msg")" \
+        >> "$STRUCTURED_LOG_FILE" 2>/dev/null || true
+}
 
 log_event() {
     local level="$1"; shift || true
@@ -68,6 +99,7 @@ log_event() {
     msg="$*"
     rotate_log_file "$LOG_FILE"
     printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+    log_structured_event "$ts" "$level" "$msg"
 }
 
 rotate_log_file() {
@@ -158,7 +190,8 @@ xray_running() {
         fi
         rm -f "$XRAY_PID_FILE" 2>/dev/null || true
     fi
-    p=$(pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" | head -1 || true)
+    command -v pgrep >/dev/null 2>&1 || return 1
+    p=$(pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" 2>/dev/null | head -1 || true)
     [[ -n "$p" ]]
 }
 
@@ -168,7 +201,9 @@ owned_xray_pids() {
     if xray_pid_matches "$p"; then
         printf '%s\n' "$p"
     fi
-    pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" 2>/dev/null || true
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" 2>/dev/null || true
+    fi
 }
 
 json_dns_ips() {
@@ -318,9 +353,174 @@ last_known_state_summary() {
     printf 'Last export  : %s\n' "$export"
 }
 
+valid_ipv4() {
+    local ip="${1:-}" IFS=. part count=0
+    [[ -n "$ip" && "$ip" != *[!0-9.]* && "$ip" == *.*.*.* && "$ip" != *.*.*.*.* ]] || return 1
+    for part in $ip; do
+        [[ "$part" =~ ^[0-9]+$ ]] || return 1
+        (( 10#$part >= 0 && 10#$part <= 255 )) || return 1
+        count=$((count + 1))
+    done
+    (( count == 4 ))
+}
+
+route_file_contains() {
+    local file="$1" ip="$2"
+    [[ -f "$file" ]] || return 1
+    grep -Fxq "$ip" "$file" 2>/dev/null
+}
+
+write_unique_route_file() {
+    local file="$1" tmp
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    awk 'NF && !seen[$0]++ {print}' > "$tmp"
+    if mv -f "$tmp" "$file"; then
+        chmod 600 "$file" 2>/dev/null || true
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+}
+
+append_unique_route() {
+    local file="$1" ip="$2"
+    valid_ipv4 "$ip" || return 1
+    mkdir -p "$(dirname "$file")" 2>/dev/null || true
+    route_file_contains "$file" "$ip" && return 1
+    { [[ -f "$file" ]] && cat "$file"; printf '%s\n' "$ip"; } | write_unique_route_file "$file"
+}
+
+remove_route_from_file() {
+    local file="$1" ip="$2" tmp
+    route_file_contains "$file" "$ip" || return 1
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    awk -v ip="$ip" 'NF && $0 != ip && !seen[$0]++ {print}' "$file" > "$tmp"
+    if [[ -s "$tmp" ]]; then
+        mv -f "$tmp" "$file" || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+        chmod 600 "$file" 2>/dev/null || true
+    else
+        rm -f "$tmp" "$file" 2>/dev/null || return 1
+    fi
+}
+
+manual_route_candidates() {
+    [[ -f "$MANUAL_ROUTE_CANDIDATES_FILE" ]] || return 0
+    while IFS= read -r ip; do
+        valid_ipv4 "$ip" && printf '%s\n' "$ip"
+    done < "$MANUAL_ROUTE_CANDIDATES_FILE"
+}
+
+blacklisted_route_candidates() {
+    [[ -f "$BLACKLISTED_ROUTE_CANDIDATES_FILE" ]] || return 0
+    while IFS= read -r ip; do
+        valid_ipv4 "$ip" && printf '%s\n' "$ip"
+    done < "$BLACKLISTED_ROUTE_CANDIDATES_FILE"
+}
+
+candidate_blacklisted() {
+    local ip="${1:-}"
+    valid_ipv4 "$ip" || return 1
+    route_file_contains "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$ip"
+}
+
+add_manual_route_candidate() {
+    local ip="${1:-}"
+    valid_ipv4 "$ip" || return 1
+    candidate_blacklisted "$ip" && return 1
+    append_unique_route "$MANUAL_ROUTE_CANDIDATES_FILE" "$ip" || return 1
+    log_event INFO "route_candidate manual_added ip=${ip}"
+    return 0
+}
+
+remove_manual_route_candidate() {
+    local ip="${1:-}"
+    valid_ipv4 "$ip" || return 1
+    remove_route_from_file "$MANUAL_ROUTE_CANDIDATES_FILE" "$ip" || return 1
+    log_event INFO "route_candidate manual_removed ip=${ip}"
+    return 0
+}
+
+pinned_route_value() {
+    local ip
+    ip=$(cat "$PINNED_ROUTE_FILE" 2>/dev/null | awk 'NF {print; exit}' || true)
+    valid_ipv4 "$ip" || return 0
+    candidate_blacklisted "$ip" && return 0
+    printf '%s\n' "$ip"
+}
+
+pin_route_candidate() {
+    local ip="${1:-}"
+    valid_ipv4 "$ip" || return 1
+    candidate_blacklisted "$ip" && return 1
+    _atomic_write "$PINNED_ROUTE_FILE" "$ip" || return 1
+    chmod 600 "$PINNED_ROUTE_FILE" 2>/dev/null || true
+    log_event INFO "route_candidate pinned ip=${ip}"
+    return 0
+}
+
+unpin_route_candidate() {
+    rm -f "$PINNED_ROUTE_FILE" 2>/dev/null || return 1
+    log_event INFO "route_candidate unpinned"
+    return 0
+}
+
+blacklist_route_candidate() {
+    local ip="${1:-}" pinned
+    valid_ipv4 "$ip" || return 1
+    pinned=$(cat "$PINNED_ROUTE_FILE" 2>/dev/null | awk 'NF {print; exit}' || true)
+    append_unique_route "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$ip" || return 1
+    if route_file_contains "$MANUAL_ROUTE_CANDIDATES_FILE" "$ip"; then
+        remove_route_from_file "$MANUAL_ROUTE_CANDIDATES_FILE" "$ip" || return 1
+    fi
+    if [[ "$pinned" == "$ip" ]]; then
+        rm -f "$PINNED_ROUTE_FILE" 2>/dev/null || return 1
+    fi
+    log_event WARN "route_candidate blacklisted ip=${ip}"
+    return 0
+}
+
+unblacklist_route_candidate() {
+    local ip="${1:-}"
+    valid_ipv4 "$ip" || return 1
+    remove_route_from_file "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$ip" || return 1
+    log_event INFO "route_candidate unblacklisted ip=${ip}"
+    return 0
+}
+
+reset_route_candidate_state() {
+    reset_route_candidate_cache
+    rm -f "$PINNED_ROUTE_FILE" "$MANUAL_ROUTE_CANDIDATES_FILE" "$BLACKLISTED_ROUTE_CANDIDATES_FILE" 2>/dev/null || true
+    log_event WARN "route_candidate state_reset"
+}
+
+reset_route_candidate_cache() {
+    rm -f "$ROUTE_HEALTH_FILE" "$LAST_GOOD_ROUTE_FILE" 2>/dev/null || true
+    log_event INFO "route_candidate cache_reset"
+}
+
+route_candidate_state_summary() {
+    local pinned
+    pinned=$(pinned_route_value)
+    printf 'Pinned route : %s\n' "${pinned:-none}"
+    printf 'Manual routes:\n'
+    if [[ -s "$MANUAL_ROUTE_CANDIDATES_FILE" ]]; then
+        manual_route_candidates | sed 's/^/  /'
+    else
+        printf '  none\n'
+    fi
+    printf 'Blacklisted routes:\n'
+    if [[ -s "$BLACKLISTED_ROUTE_CANDIDATES_FILE" ]]; then
+        blacklisted_route_candidates | sed 's/^/  /'
+    else
+        printf '  none\n'
+    fi
+}
+
 resolve_domain_ips() {
     local domain="$1" candidates joined
     candidates=$({
+        pinned_route_value
+        manual_route_candidates
         if [[ -n "${G2RAY_EXTRA_FALLBACK_IPS:-}" ]]; then
             printf '%s\n' "$G2RAY_EXTRA_FALLBACK_IPS" | tr ',; ' '\n'
         fi
@@ -332,7 +532,11 @@ resolve_domain_ips() {
         json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json"
         curl_remote_ip "$domain" || true
         printf '%s\n' "$DEFAULT_FALLBACK_IPS" | tr ',; ' '\n'
-    } | awk '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/ && !seen[$0]++ {print}')
+    } | while IFS= read -r ip; do
+        valid_ipv4 "$ip" || continue
+        candidate_blacklisted "$ip" && continue
+        printf '%s\n' "$ip"
+    done | awk '!seen[$0]++ {print}')
     if [[ -n "$candidates" ]]; then
         joined=$(printf '%s' "$candidates" | tr '\n' ',' | sed 's/,$//')
         log_event INFO "resolver domain=${domain} fallback_candidates=${joined}"
@@ -459,7 +663,7 @@ test_cloudflare_waker() {
     fi
 
     echo -e "  ${DIM}Calling Worker with Authorization: Bearer ...${NC}"
-    response=$(curl -sS -m 30 -X POST -H "Authorization: Bearer ${wake_secret}" "$worker_url" 2>&1) || {
+    response=$(curl -sS -m "$WAKER_TEST_TIMEOUT_SEC" -X POST -H "Authorization: Bearer ${wake_secret}" "$worker_url" 2>&1) || {
         echo -e "  ${RED}Worker call failed.${NC}"
         printf '%s\n' "$response" | sed 's/^/  /'
         return 1
@@ -487,7 +691,7 @@ show_waker_recovery_guide() {
     echo -e "  3. Click Start Codespace."
     echo -e "  4. If the Worker reports ${WHITE}route_ready: true${NC}, use the same v2rayN config again."
     echo -e "  5. If it reports ${WHITE}route_ready: false${NC} or HTTP 404, wait 1-2 minutes and retry."
-    echo -e "  6. If it stays stuck, open the panel and use option ${WHITE}6) Force Reconnect${NC}.\n"
+    echo -e "  6. If it stays stuck, open the panel and use option ${WHITE}6) Recover Now${NC}.\n"
     echo -e "  This works only if the Codespace still exists and GitHub quota/token are valid."
     echo -e "  It cannot bypass quota, billing, deletion, or account restrictions.\n"
     echo -e "  ${WHITE}${B}Saved Waker${NC}"
@@ -608,6 +812,32 @@ maybe_prompt_waker_setup() {
     read -r answer || { touch "$WAKER_PROMPT_FILE" 2>/dev/null || true; return 0; }
     touch "$WAKER_PROMPT_FILE" 2>/dev/null || true
     [[ "$answer" =~ ^[Yy]$ ]] && setup_cloudflare_waker
+}
+
+show_recovery_command_card() {
+    local worker_url
+    worker_url=$(waker_metadata_value worker_url)
+    refresh_screen
+    echo -e "\n  ${RED}First-run Recovery Card${NC}\n"
+    echo -e "  ${WHITE}Keep these commands handy for the next time GitHub wakes slowly.${NC}"
+    echo -e "  ${DIM}This card prints placeholders only; replace <WAKE_SECRET> with your saved secret.${NC}\n"
+    echo -e "  ${WHITE}${B}copy these recovery commands${NC}"
+    echo -e "  ${GREEN}bash ./g2ray.sh --doctor-json${NC}"
+    echo -e "  ${GREEN}bash ./g2ray.sh --recover-now${NC}"
+    if [[ -n "$worker_url" ]]; then
+        echo -e "  ${GREEN}curl -X POST -H \"Authorization: Bearer <WAKE_SECRET>\" \"${worker_url}\"${NC}"
+        echo -e "  ${DIM}For PowerShell, keep the URL the same and replace <WAKE_SECRET> manually.${NC}"
+    else
+        echo -e "  ${DIM}Worker wake command appears here after option 15 is configured.${NC}"
+    fi
+    echo ""
+    echo -e "  ${WHITE}${B}Log files${NC}"
+    echo -e "  ${WHITE}${LOG_FILE}${NC}"
+    echo -e "  ${WHITE}${STRUCTURED_LOG_FILE}${NC}"
+    echo -e "  ${WHITE}${DIAGNOSTIC_LOG_FILE}${NC}\n"
+    echo -e "  ${DIM}After this, diagnostics will open automatically so you can confirm route, supervisor, and waker state.${NC}"
+    echo -ne "  ${DIM}Press Enter to open diagnostics...${NC}"
+    read -r || true
 }
 
 write_config_qr_png() {
@@ -785,13 +1015,48 @@ xray_listener_ready() {
     xhttp_status_usable "$code"
 }
 
+stamp_age_sec() {
+    local file="$1" now stamp
+    [[ -f "$file" ]] || { printf '999999999'; return 0; }
+    now=$(date +%s 2>/dev/null || printf '0')
+    stamp=$(cat "$file" 2>/dev/null || printf '0')
+    [[ "$stamp" =~ ^[0-9]+$ ]] || stamp=0
+    printf '%s' "$(( now - stamp ))"
+}
+
+file_age_sec() {
+    local file="$1" now mtime
+    [[ -f "$file" ]] || { printf '999999999'; return 0; }
+    now=$(date +%s 2>/dev/null || printf '0')
+    mtime=$(stat -c %Y "$file" 2>/dev/null || printf '0')
+    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+    printf '%s' "$(( now - mtime ))"
+}
+
+write_epoch_stamp() {
+    local file="$1" now
+    now=$(date +%s 2>/dev/null || printf '0')
+    _atomic_write "$file" "$now"
+    chmod 600 "$file" 2>/dev/null || true
+}
+
 ensure_codespace_port_public() {
+    local force="${1:-}" age stamp_file
+    stamp_file="${PORT_PUBLIC_STAMP_FILE}.${CODESPACE_NAME}.${XRAY_PORT}"
+    stamp_file=$(printf '%s' "$stamp_file" | tr -c 'A-Za-z0-9._/-' '_')
+    age=$(stamp_age_sec "$stamp_file")
+    if [[ "$force" != "force" && "$PORT_PUBLIC_TTL_SEC" =~ ^[0-9]+$ && "$age" -lt "$PORT_PUBLIC_TTL_SEC" ]]; then
+        log_event INFO "port_public cached_ok port=${XRAY_PORT} age_sec=${age} ttl=${PORT_PUBLIC_TTL_SEC}"
+        return 0
+    fi
     command -v gh >/dev/null 2>&1 || {
         log_event WARN "port_public gh_missing port=${XRAY_PORT}"
         return 1
     }
     local output
     if output=$(run_gh codespace ports visibility "${XRAY_PORT}:public" -c "$CODESPACE_NAME" </dev/null 2>&1); then
+        write_epoch_stamp "$stamp_file"
+        log_event INFO "port_public ok port=${XRAY_PORT} forced=${force:-false}"
         return 0
     fi
     output=$(printf '%s' "$output" | tr '\r\n' '  ' | cut -c1-180)
@@ -805,7 +1070,7 @@ repair_codespace_port_route() {
     run_gh codespace ports visibility "${XRAY_PORT}:private" -c "$CODESPACE_NAME" \
         </dev/null >/dev/null 2>&1 || true
     sleep 2
-    if ensure_codespace_port_public; then
+    if ensure_codespace_port_public force; then
         log_event INFO "route_repair public_ok port=${XRAY_PORT}"
         return 0
     fi
@@ -818,22 +1083,62 @@ wait_for_xhttp_route_ready() {
     [[ "$max_wait" =~ ^[0-9]+$ ]] || max_wait=120
     start=$(date +%s 2>/dev/null || printf '0')
     while true; do
+        attempt=$(( attempt + 1 ))
         read -r xcode xms < <(xhttp_probe_metrics external)
         now=$(date +%s 2>/dev/null || printf '0')
         elapsed=$(( now - start ))
         if xhttp_status_usable "$xcode"; then
             log_event INFO "runtime_ready reason=${reason} route_wait_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} wait_sec=${elapsed}"
+            record_route_settling_metric "$reason" "ready" "${xcode:-0}" "${xms:-0}" "$elapsed" "$attempt"
             return 0
         fi
         (( elapsed >= max_wait )) && break
-        if (( attempt == 0 || attempt % 5 == 0 )); then
+        if (( attempt == 1 || attempt % 5 == 0 )); then
             ensure_codespace_port_public >/dev/null 2>&1 || true
         fi
-        attempt=$(( attempt + 1 ))
         sleep 3
     done
     log_event WARN "runtime_ready reason=${reason} route_wait_timeout xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} wait_sec=${max_wait}"
+    record_route_settling_metric "$reason" "timeout" "${xcode:-0}" "${xms:-0}" "$max_wait" "$attempt"
     return 1
+}
+
+record_route_settling_metric() {
+    local reason="$1" result="$2" code="$3" ms="$4" wait_sec="$5" attempts="$6" checked
+    checked=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$checked" "$reason" "$result" "${code:-0}" "${ms:-0}" "${wait_sec:-0}" "${attempts:-0}" \
+        >> "$ROUTE_SETTLING_HISTORY_FILE" 2>/dev/null || true
+    chmod 600 "$ROUTE_SETTLING_HISTORY_FILE" 2>/dev/null || true
+}
+
+route_settling_history_summary() {
+    if [[ ! -s "$ROUTE_SETTLING_HISTORY_FILE" ]]; then
+        printf 'Last route wait : none recorded\n'
+        printf 'History         : no route-settling waits have completed yet\n'
+        return 0
+    fi
+    awk -F '\t' '
+        NF >= 7 {
+            n++;
+            wait_sum += $6;
+            last = $0;
+            if ($3 == "ready") ready++;
+            if ($3 == "timeout") timeout++;
+        }
+        END {
+            if (n == 0) {
+                print "Last route wait : none recorded";
+                print "History         : no route-settling waits have completed yet";
+                exit
+            }
+            split(last, f, "\t");
+            printf "Last route wait : %s reason=%s result=%s http=%s wait=%ss attempts=%s\n", f[1], f[2], f[3], f[4], f[6], f[7];
+            printf "Summary         : samples=%d ready=%d timeout=%d avg_wait=%ds\n", n, ready+0, timeout+0, wait_sum / n;
+            print "Recent waits    :";
+        }
+    ' "$ROUTE_SETTLING_HISTORY_FILE" 2>/dev/null
+    tail -n 6 "$ROUTE_SETTLING_HISTORY_FILE" 2>/dev/null | awk -F '\t' 'NF >= 7 {printf "  %s %-22s %-7s HTTP %-3s wait=%ss attempts=%s\n", $1, $2, $3, $4, $6, $7}'
 }
 
 save_xray_stats() {
@@ -1414,7 +1719,14 @@ show_resource_stats() {
     refresh_screen
     echo -e "\n  ${GREEN}● Live Resource Stats${NC}"
     local xpid cpu mem_kb mem_mb
-    xpid=$(pgrep -x "xray" | head -1 || pgrep -f "$XRAY_BIN run" | head -1 || true)
+    xpid=""
+    if [[ -f "$XRAY_PID_FILE" ]]; then
+        xpid=$(cat "$XRAY_PID_FILE" 2>/dev/null || true)
+        xray_pid_matches "$xpid" || xpid=""
+    fi
+    if [[ -z "$xpid" ]]; then
+        xpid=$(owned_xray_pids | head -1 || true)
+    fi
     if [[ -n "$xpid" ]]; then
         read -r cpu mem_kb <<< "$(ps -p "$xpid" -o %cpu,rss --no-headers 2>/dev/null || echo '0 0')"
         mem_mb=$(awk "BEGIN{printf \"%.1f\",${mem_kb:-0}/1024}")
@@ -1552,9 +1864,45 @@ record_route_candidate_health() {
         "$checked" "$ip" "${code:-0}" "${ms:-0}" "$usable" >> "${route_health_tmp:-$ROUTE_HEALTH_FILE}"
 }
 
+save_last_good_route() {
+    local ip="$1" code="${2:-0}" ms="${3:-0}" source="${4:-probe}" checked content
+    [[ -n "$ip" ]] || return 0
+    checked=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
+    content=$(printf 'ip=%s\nhttp_status=%s\nlatency_ms=%s\nsource=%s\nchecked_at=%s\n' \
+        "$ip" "$code" "$ms" "$source" "$checked")
+    _atomic_write "$LAST_GOOD_ROUTE_FILE" "$content"
+    chmod 600 "$LAST_GOOD_ROUTE_FILE" 2>/dev/null || true
+    log_event INFO "last_good_route saved ip=${ip} http=${code} latency_ms=${ms} source=${source}"
+}
+
+last_good_route_value() {
+    [[ -f "$LAST_GOOD_ROUTE_FILE" ]] || return 0
+    awk -F= '$1 == "ip" {print $2; exit}' "$LAST_GOOD_ROUTE_FILE" 2>/dev/null || true
+}
+
+last_good_route_summary() {
+    if [[ ! -s "$LAST_GOOD_ROUTE_FILE" ]]; then
+        printf 'Last good route : none recorded\n'
+        return 0
+    fi
+    awk -F= '
+        $1 == "ip" {ip=$2}
+        $1 == "http_status" {code=$2}
+        $1 == "latency_ms" {ms=$2}
+        $1 == "source" {source=$2}
+        $1 == "checked_at" {checked=$2}
+        END {
+            printf "Last good route : %s HTTP %s %sms source=%s checked=%s\n",
+                (ip ? ip : "unknown"), (code ? code : "unknown"),
+                (ms ? ms : "0"), (source ? source : "unknown"),
+                (checked ? checked : "unknown")
+        }
+    ' "$LAST_GOOD_ROUTE_FILE" 2>/dev/null
+}
+
 refresh_route_candidate_health() {
     [[ -f "$CONFIG_FILE" ]] || return 0
-    local candidates ip ip_probe ip_ms count=0 max route_health_tmp
+    local candidates ip ip_probe ip_ms count=0 max route_health_tmp best_ip="" best_code=0 best_ms=99999999
     max=$(route_monitor_max_candidates)
     candidates=$(resolve_domain_ips "$PORT_DOMAIN" || true)
     [[ -n "$candidates" ]] || return 0
@@ -1563,15 +1911,53 @@ refresh_route_candidate_health() {
         [[ -n "$ip" ]] || continue
         read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
         record_route_candidate_health "$ip" "$ip_probe" "$ip_ms"
+        if xhttp_status_usable "$ip_probe" && [[ "$ip_ms" =~ ^[0-9]+$ ]] && (( ip_ms < best_ms )); then
+            best_ip="$ip"
+            best_code="$ip_probe"
+            best_ms="$ip_ms"
+        fi
         count=$((count + 1))
         (( count >= max )) && break
     done <<< "$candidates"
     mv "$route_health_tmp" "$ROUTE_HEALTH_FILE"
     chmod 600 "$ROUTE_HEALTH_FILE" 2>/dev/null || true
+    [[ -n "$best_ip" ]] && save_last_good_route "$best_ip" "$best_code" "$best_ms" "route_candidate_monitor"
     log_event INFO "route_candidate_monitor refreshed count=${count} max=${max}"
 }
 
+route_health_cache_fresh() {
+    local age
+    [[ -s "$ROUTE_HEALTH_FILE" ]] || return 1
+    age=$(file_age_sec "$ROUTE_HEALTH_FILE")
+    [[ "$ROUTE_HEALTH_TTL_SEC" =~ ^[0-9]+$ ]] || ROUTE_HEALTH_TTL_SEC=300
+    (( age <= ROUTE_HEALTH_TTL_SEC ))
+}
+
+cached_usable_fallback_ips() {
+    [[ -s "$ROUTE_HEALTH_FILE" ]] || return 1
+    local last_good pinned
+    pinned=$(pinned_route_value)
+    last_good=$(last_good_route_value)
+    awk -F '\t' -v pinned="$pinned" -v last_good="$last_good" '
+        NF >= 5 && $5 == "true" {
+            latency = ($4 ~ /^[0-9]+$/) ? $4 : 99999999
+            if ($2 == pinned) preferred = 0
+            else if ($2 == last_good) preferred = 1
+            else preferred = 2
+            printf "%d\t%08d\t%s\t%s\t%s\n", preferred, latency, $2, $3, $4
+        }
+    ' "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n \
+        | while IFS=$'\t' read -r _preferred _latency ip _code _ms; do
+            valid_ipv4 "$ip" || continue
+            candidate_blacklisted "$ip" && continue
+            printf '%s\n' "$ip"
+        done | awk '!seen[$0]++ {print}'
+}
+
 route_candidate_health_summary() {
+    local pinned
+    pinned=$(pinned_route_value)
+    printf 'Pinned route : %s\n' "${pinned:-none}"
     if [[ ! -s "$ROUTE_HEALTH_FILE" ]]; then
         printf 'Last refresh : none recorded\n'
         printf 'Candidates   : no cached candidate route probes yet\n'
@@ -1586,20 +1972,193 @@ route_candidate_health_summary() {
         NF >= 5 {
             rank = ($5 == "true") ? 0 : 1
             latency = ($4 ~ /^[0-9]+$/) ? $4 : 99999999
-            printf "%d\t%08d\t%-15s HTTP %-3s %4sms usable=%s\n", rank, latency, $2, $3, $4, $5
+            line = sprintf("%-15s HTTP %-3s %4sms usable=%s", $2, $3, $4, $5)
+            printf "%d\t%08d\t%s\t%s\n", rank, latency, $2, line
         }
-    ' "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n | cut -f3-
+    ' "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n \
+        | while IFS=$'\t' read -r _rank _latency ip line; do
+            candidate_blacklisted "$ip" && continue
+            printf '%s\n' "$line"
+        done
+}
+
+show_route_candidate_manager() {
+    local choice ip
+    while true; do
+        refresh_screen
+        echo -e "\n  ${RED}Route Candidates${NC}\n"
+        echo -e "  ${WHITE}${B}Manual and pinned routes${NC}"
+        route_candidate_state_summary | sed 's/^/  /'
+        echo ""
+        echo -e "  ${WHITE}${B}Measured candidates${NC}"
+        route_candidate_health_summary | sed 's/^/  /'
+        echo ""
+        echo -e "  ${RED}1)${NC} Refresh Route Probes"
+        echo -e "  ${RED}2)${NC} Add Manual IPv4 Candidate"
+        echo -e "  ${RED}3)${NC} Pin Preferred Route"
+        echo -e "  ${RED}4)${NC} Blacklist Bad Route"
+        echo -e "  ${RED}5)${NC} Remove Manual Route"
+        echo -e "  ${RED}6)${NC} Unblacklist Route"
+        echo -e "  ${RED}7)${NC} Reset Route Health Cache"
+        echo -e "  ${RED}8)${NC} Reset All Route Preferences"
+        echo -e "  ${RED}9)${NC} Refresh Exports"
+        echo -e "  ${RED}0)${NC} Return"
+        echo -ne "  ${RED}Select:${NC} "
+        read -r choice || return 0
+        case "$choice" in
+            1)
+                refresh_route_candidate_health >/dev/null 2>&1 || true
+                echo -e "  ${GREEN}Route probes refreshed.${NC}"; sleep 1
+                ;;
+            2)
+                echo -ne "  ${GREEN}Manual IPv4:${NC} "
+                read -r ip || continue
+                if add_manual_route_candidate "$ip"; then
+                    refresh_route_candidate_health >/dev/null 2>&1 || true
+                    refresh_config_exports >/dev/null 2>&1 || true
+                    echo -e "  ${GREEN}Added.${NC}"
+                else
+                    echo -e "  ${RED}Invalid, duplicate, or blacklisted IPv4.${NC}"
+                fi
+                sleep 1
+                ;;
+            3)
+                echo -ne "  ${GREEN}IPv4 to pin:${NC} "
+                read -r ip || continue
+                if pin_route_candidate "$ip"; then
+                    refresh_config_exports >/dev/null 2>&1 || true
+                    echo -e "  ${GREEN}Pinned preferred route.${NC}"
+                else
+                    echo -e "  ${RED}Invalid or blacklisted IPv4.${NC}"
+                fi
+                sleep 1
+                ;;
+            4)
+                echo -ne "  ${YELLOW}IPv4 to blacklist:${NC} "
+                read -r ip || continue
+                if blacklist_route_candidate "$ip"; then
+                    refresh_config_exports >/dev/null 2>&1 || true
+                    echo -e "  ${YELLOW}Blacklisted.${NC}"
+                else
+                    echo -e "  ${RED}Invalid IPv4.${NC}"
+                fi
+                sleep 1
+                ;;
+            5)
+                echo -ne "  ${GREEN}Manual IPv4 to remove:${NC} "
+                read -r ip || continue
+                if remove_manual_route_candidate "$ip"; then
+                    refresh_config_exports >/dev/null 2>&1 || true
+                    echo -e "  ${GREEN}Removed.${NC}"
+                else
+                    echo -e "  ${RED}Invalid IPv4.${NC}"
+                fi
+                sleep 1
+                ;;
+            6)
+                echo -ne "  ${GREEN}IPv4 to unblacklist:${NC} "
+                read -r ip || continue
+                if unblacklist_route_candidate "$ip"; then
+                    refresh_route_candidate_health >/dev/null 2>&1 || true
+                    refresh_config_exports >/dev/null 2>&1 || true
+                    echo -e "  ${GREEN}Unblacklisted.${NC}"
+                else
+                    echo -e "  ${RED}Invalid IPv4 or route is not blacklisted.${NC}"
+                fi
+                sleep 1
+                ;;
+            7)
+                echo -ne "  ${YELLOW}Reset measured route health cache only? (y/n):${NC} "
+                read -r ip || continue
+                if [[ "$ip" =~ ^[Yy]$ ]]; then
+                    reset_route_candidate_cache
+                    refresh_config_exports >/dev/null 2>&1 || true
+                    echo -e "  ${GREEN}Route health cache reset. Manual, pinned, and blacklisted routes were kept.${NC}"
+                    sleep 1
+                fi
+                ;;
+            8)
+                echo -ne "  ${YELLOW}Reset manual routes, blacklist, pin, and route cache? (y/n):${NC} "
+                read -r ip || continue
+                if [[ "$ip" =~ ^[Yy]$ ]]; then
+                    reset_route_candidate_state
+                    refresh_config_exports >/dev/null 2>&1 || true
+                    echo -e "  ${GREEN}All route preferences and cached measurements reset.${NC}"
+                    sleep 1
+                fi
+                ;;
+            9)
+                refresh_route_candidate_health >/dev/null 2>&1 || true
+                refresh_config_exports >/dev/null 2>&1 || true
+                echo -e "  ${GREEN}Routes and exports refreshed.${NC}"; sleep 1
+                ;;
+            0) return 0 ;;
+            *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+show_live_monitor() {
+    local choice tick=1 local_code local_ms edge_code edge_ms engine listener
+    while true; do
+        if [[ -f "$CONFIG_FILE" && $((tick % 6)) -eq 0 ]]; then
+            refresh_route_candidate_health >/dev/null 2>&1 || true
+        fi
+        read -r local_code local_ms < <(xhttp_probe_metrics local)
+        read -r edge_code edge_ms < <(xhttp_probe_metrics external)
+        xray_running && engine="running" || engine="stopped"
+        is_port_open && listener="open" || listener="closed"
+        refresh_screen
+        echo -e "\n  ${RED}Live Monitor${NC}"
+        echo -e "  ${DIM}Refreshes every 10 seconds. Press Enter or q to return.${NC}\n"
+        echo -e "  Engine        : ${WHITE}${engine}${NC}"
+        echo -e "  Listener      : ${WHITE}${listener}${NC}"
+        echo -e "  Local XHTTP   : HTTP ${local_code:-0} ${local_ms:-0}ms usable=$(xhttp_status_usable "$local_code" && printf true || printf false)"
+        echo -e "  Edge XHTTP    : HTTP ${edge_code:-0} ${edge_ms:-0}ms usable=$(xhttp_status_usable "$edge_code" && printf true || printf false)"
+        echo -e "  Supervisor    : ${WHITE}$(background_supervisor_status)${NC}"
+        echo -e "  Self-heal     : ${WHITE}$(self_heal_state_summary)${NC}\n"
+        echo -e "  ${WHITE}${B}Best Route Candidates${NC}"
+        route_candidate_health_summary | sed 's/^/  /'
+        echo -e "\n  ${WHITE}${B}Route Settling${NC}"
+        route_settling_history_summary | sed 's/^/  /'
+        echo -e "\n  ${WHITE}${B}Recent Events${NC}"
+        if [[ -s "$LOG_FILE" ]]; then
+            tail -n 8 "$LOG_FILE" | sed 's/^/  /'
+        else
+            echo -e "  ${DIM}No events logged yet.${NC}"
+        fi
+        echo -ne "\n  ${DIM}Press Enter/q to return, or wait to refresh...${NC} "
+        if IFS= read -r -t 10 choice; then
+            [[ -z "$choice" || "$choice" =~ ^[Qq]$ ]] && return 0
+        fi
+        tick=$((tick + 1))
+    done
 }
 
 usable_fallback_ips() {
     local ip ip_probe ip_ms count=0 max_links="$MAX_FALLBACK_LINKS" candidates usable
     [[ "$max_links" =~ ^[0-9]+$ && "$max_links" -gt 0 ]] || max_links=3
+    if ! route_health_cache_fresh; then
+        refresh_route_candidate_health >/dev/null 2>&1 || true
+    fi
+    if route_health_cache_fresh && cached_usable_fallback_ips >/dev/null 2>&1; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] || continue
+            printf '%s\n' "$ip"
+            count=$((count + 1))
+            (( count >= max_links )) && return 0
+        done < <(cached_usable_fallback_ips)
+        (( count > 0 )) && return 0
+    fi
+
     candidates=$(resolve_domain_ips "$PORT_DOMAIN" || true)
     while IFS= read -r ip; do
         [[ -n "$ip" ]] || continue
+        candidate_blacklisted "$ip" && continue
         read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
         if xhttp_status_usable "$ip_probe"; then
             printf '%s\n' "$ip"
+            save_last_good_route "$ip" "$ip_probe" "$ip_ms" "live_fallback_probe"
             usable=true
             count=$((count + 1))
         else
@@ -1694,9 +2253,66 @@ do_donate_config() {
     sleep 2
 }
 
+log_diagnostic_snapshot() {
+    local reason="${1:-diagnostics}" local_probe local_ms edge_probe edge_ms engine listener supervisor ts
+    local waker_url waker_codespace waker_fp waker_at
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+    read -r local_probe local_ms < <(xhttp_probe_metrics local)
+    read -r edge_probe edge_ms < <(xhttp_probe_metrics external)
+    xray_running && engine=running || engine=stopped
+    is_port_open && listener=open || listener=closed
+    supervisor=$(background_supervisor_status | tr '\r\n' ' ' | cut -c1-180)
+    log_event INFO "diagnostic_snapshot reason=${reason} engine=${engine} listener=${listener} local_probe=${local_probe:-0} local_ms=${local_ms:-0} edge_probe=${edge_probe:-0} edge_ms=${edge_ms:-0} supervisor=${supervisor:-unknown} last_good=$(last_good_route_value)"
+    waker_url=$(waker_metadata_value worker_url)
+    waker_codespace=$(waker_metadata_value codespace_name)
+    waker_fp=$(waker_metadata_value wake_secret_fingerprint)
+    waker_at=$(waker_metadata_value configured_at)
+    rotate_log_file "$DIAGNOSTIC_LOG_FILE"
+    {
+        printf '===== Diagnostic Snapshot %s =====\n' "$ts"
+        printf 'reason: %s\n' "$reason"
+        printf 'identity: %s\n' "$CODESPACE_NAME"
+        printf 'domain: %s\n' "$PORT_DOMAIN"
+        printf 'port: %s\n' "$XRAY_PORT"
+        printf 'engine: %s\n' "$engine"
+        printf 'listener: %s\n' "$listener"
+        printf 'local_xhttp_options: HTTP %s latency_ms=%s usable=%s\n' "${local_probe:-0}" "${local_ms:-0}" "$(xhttp_status_usable "$local_probe" && printf true || printf false)"
+        printf 'edge_xhttp_options: HTTP %s latency_ms=%s usable=%s\n' "${edge_probe:-0}" "${edge_ms:-0}" "$(xhttp_status_usable "$edge_probe" && printf true || printf false)"
+        printf 'supervisor: %s\n' "${supervisor:-unknown}"
+        printf 'self_heal: %s\n' "$(self_heal_state_summary)"
+        printf 'resume_gap:\n'
+        resume_gap_summary | sed 's/^/  /'
+        printf 'last_known_state:\n'
+        last_known_state_summary | sed 's/^/  /'
+        printf 'external_waker:\n'
+        if [[ -n "$waker_url" ]]; then
+            printf '  status: configured\n'
+            printf '  worker_url: %s\n' "$waker_url"
+            printf '  codespace: %s\n' "${waker_codespace:-$CODESPACE_NAME}"
+            printf '  secret: fingerprint=%s raw_secret_stored=false\n' "${waker_fp:-unknown}"
+            printf '  last_setup: %s\n' "${waker_at:-unknown}"
+        else
+            printf '  status: not configured\n'
+        fi
+        printf 'last_good_route:\n'
+        last_good_route_summary | sed 's/^/  /'
+        printf 'route_settling_history:\n'
+        route_settling_history_summary | sed 's/^/  /'
+        printf 'recent_events:\n'
+        if [[ -s "$LOG_FILE" ]]; then
+            tail -n 12 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
+        else
+            printf '  none\n'
+        fi
+        printf '\n'
+    } >> "$DIAGNOSTIC_LOG_FILE" 2>/dev/null || true
+    chmod 600 "$DIAGNOSTIC_LOG_FILE" 2>/dev/null || true
+}
+
 show_diagnostics() {
     refresh_screen
     log_event INFO "diagnostics opened"
+    log_diagnostic_snapshot "interactive"
     echo -e "\n  ${RED}● Diagnostics${NC}\n"
     echo -e "  Identity : ${WHITE}${CODESPACE_NAME}${NC}"
     echo -e "  Domain   : ${WHITE}${PORT_DOMAIN}${NC}"
@@ -1705,7 +2321,10 @@ show_diagnostics() {
         echo -e "  Git      : ${DIM}$(git -C "$BASE_DIR" log --oneline -1 2>/dev/null || echo unknown)${NC}"
     fi
     if xray_running; then
-        local xpid; xpid=$(cat "$XRAY_PID_FILE" 2>/dev/null || pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" | head -1 || true)
+        local xpid; xpid=$(cat "$XRAY_PID_FILE" 2>/dev/null || true)
+        if [[ -z "$xpid" ]] && command -v pgrep >/dev/null 2>&1; then
+            xpid=$(pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" 2>/dev/null | head -1 || true)
+        fi
         echo -e "  Engine   : ${GREEN}Running${NC} ${DIM}(PID ${xpid:-unknown})${NC}"
     else
         echo -e "  Engine   : ${RED}Stopped${NC}"
@@ -1790,6 +2409,19 @@ show_diagnostics() {
     echo -e "\n  ${WHITE}${B}Best Route Candidates${NC}"
     route_candidate_health_summary | sed 's/^/  /'
 
+    echo -e "\n  ${WHITE}${B}Last Good Route${NC}"
+    last_good_route_summary | sed 's/^/  /'
+
+    echo -e "\n  ${WHITE}${B}Route Settling History${NC}"
+    route_settling_history_summary | sed 's/^/  /'
+
+    echo -e "\n  ${WHITE}${B}Persistent Logs${NC}"
+    echo -e "  App events      : ${WHITE}${LOG_FILE}${NC}"
+    echo -e "  Structured JSONL: ${WHITE}${STRUCTURED_LOG_FILE}${NC}"
+    echo -e "  Diagnostics    : ${WHITE}${DIAGNOSTIC_LOG_FILE}${NC}"
+    echo -e "  Xray errors     : ${WHITE}${LOG_DIR}/xray-error.log${NC}"
+    echo -e "  ${DIM}These files persist across panel screens and are rotated by size.${NC}"
+
     echo -e "\n  ${WHITE}${B}Recent G2ray Events${NC}"
     if [[ -s "$LOG_FILE" ]]; then
         tail -n 18 "$LOG_FILE" | sed 's/^/  /'
@@ -1804,6 +2436,111 @@ show_diagnostics() {
         echo -e "  ${DIM}No Xray errors logged.${NC}"
     fi
     echo ""; echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
+}
+
+recover_now() {
+    local no_prompt="${1:-}" failed=0 expose_failed=false route_ready=false engine_started=false xcode=0 xms=0
+    log_event INFO "recover_now begin no_prompt=${no_prompt:-false}"
+    echo -e "\n  ${GREEN}*${NC} ${WHITE}Running Soft Recover Sequence...${NC}\n"
+
+    echo -ne "  ${DIM}|-${NC} Detect Identity   : "
+    CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
+    PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+    log_event INFO "recover_now identity codespace=${CODESPACE_NAME} domain=${PORT_DOMAIN}"
+    [[ "$CODESPACE_NAME" == "unknown-codespace" ]] \
+        && echo -e "${RED}Failed${NC}" \
+        || echo -e "${GREEN}${CODESPACE_NAME}${NC}"
+
+    echo -ne "  ${DIM}|-${NC} Verify Engine     : "
+    if xray_listener_ready; then
+        echo -e "${GREEN}Running${NC}"
+    else
+        if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1 && xray_listener_ready; then
+            engine_started=true
+            log_event INFO "recover_now engine_started port=${XRAY_PORT}"
+            echo -e "${GREEN}Started${NC}"
+        else
+            failed=1
+            log_event ERROR "recover_now engine_unavailable port=${XRAY_PORT}"
+            echo -e "${RED}Failed${NC}"
+        fi
+    fi
+
+    echo -ne "  ${DIM}|-${NC} Expose Tunnel     : "
+    if ensure_codespace_port_public force >/dev/null 2>&1; then
+        echo -e "${GREEN}Done${NC}"
+    else
+        expose_failed=true
+        failed=1
+        log_event WARN "recover_now expose_tunnel failed port=${XRAY_PORT}"
+        echo -e "${YELLOW}Needs PORTS tab${NC}"
+    fi
+
+    echo -ne "  ${DIM}|-${NC} Wait Route        : "
+    if wait_for_xhttp_route_ready "recover_now" "$ROUTE_WAIT_SEC" >/dev/null 2>&1; then
+        read -r xcode xms < <(xhttp_probe_metrics external)
+        route_ready=true
+        echo -e "${GREEN}Ready (HTTP ${xcode})${NC}"
+    else
+        read -r xcode xms < <(xhttp_probe_metrics external)
+        echo -e "${YELLOW}Settling (HTTP ${xcode:-0})${NC}"
+    fi
+
+    if [[ "$route_ready" != true ]]; then
+        echo -ne "  ${DIM}|-${NC} Repair Route      : "
+        repair_codespace_port_route >/dev/null 2>&1 || true
+        if wait_for_xhttp_route_ready "recover_now_repair" "$FORCE_RECONNECT_ROUTE_WAIT_SEC" >/dev/null 2>&1; then
+            read -r xcode xms < <(xhttp_probe_metrics external)
+            route_ready=true
+            echo -e "${GREEN}Ready (HTTP ${xcode})${NC}"
+        else
+            read -r xcode xms < <(xhttp_probe_metrics external)
+            echo -e "${YELLOW}Still settling (HTTP ${xcode:-0})${NC}"
+        fi
+    fi
+
+    echo -ne "  ${DIM}|-${NC} Refresh Routes    : "
+    refresh_route_candidate_health >/dev/null 2>&1 || true
+    echo -e "${GREEN}Done${NC}"
+
+    echo -ne "  ${DIM}\\-${NC} Refresh Exports   : "
+    if refresh_config_exports >/dev/null 2>&1; then
+        echo -e "${GREEN}Done${NC}"
+    else
+        log_event WARN "recover_now export_refresh_failed"
+        echo -e "${YELLOW}Skipped${NC}"
+    fi
+
+    log_diagnostic_snapshot "recover_now"
+    log_event INFO "recover_now complete route_ready=${route_ready} xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} engine_started=${engine_started} expose_failed=${expose_failed}"
+
+    if [[ "$route_ready" == true ]]; then
+        failed=0
+        reset_route_bad_count
+        reset_edge_bad_count
+        echo -e "\n  ${GREEN}Soft recover complete. Try the same config again.${NC}\n"
+    else
+        failed=1
+        echo -e "\n  ${YELLOW}Route is still settling. Waiting usually fixes this; hard restart is available if it stays stuck.${NC}\n"
+    fi
+
+    if [[ "$no_prompt" == "--no-prompt" ]]; then
+        return "$failed"
+    fi
+
+    if [[ "$route_ready" != true ]]; then
+        echo -ne "  ${GREEN}Run hard restart now?${NC} (y/n): "
+        local hard
+        read -r hard
+        if [[ "$hard" =~ ^[Yy]$ ]]; then
+            force_reconnect
+            return $?
+        fi
+    else
+        echo -ne "  ${DIM}Press Enter to return...${NC}"
+        read -r
+    fi
+    return "$failed"
 }
 
 force_reconnect() {
@@ -1842,7 +2579,7 @@ force_reconnect() {
     fi
 
     echo -ne "  ${DIM}├─${NC} Expose Tunnel     : "
-    if ensure_codespace_port_public >/dev/null 2>&1; then
+    if ensure_codespace_port_public force >/dev/null 2>&1; then
         log_event INFO "force_reconnect expose_tunnel ok port=${XRAY_PORT}"
         echo -e "${GREEN}Done${NC}"
     else
@@ -1949,6 +2686,53 @@ ensure_runtime_ready() {
     return 1
 }
 
+print_doctor_json() {
+    local engine=false listener=false local_probe=0 local_ms=0 edge_probe=0 edge_ms=0 supervisor last_good waker_url doctor_port
+    doctor_port="$XRAY_PORT"
+    [[ "$doctor_port" =~ ^[0-9]+$ && "$doctor_port" -gt 0 && "$doctor_port" -le 65535 ]] || doctor_port=443
+    xray_running && engine=true
+    is_port_open && listener=true
+    read -r local_probe local_ms < <(xhttp_probe_metrics local)
+    read -r edge_probe edge_ms < <(xhttp_probe_metrics external)
+    supervisor=$(background_supervisor_status | tr '\r\n' ' ' | cut -c1-180)
+    last_good=$(last_good_route_value)
+    waker_url=$(waker_metadata_value worker_url)
+    log_event INFO "doctor_json requested engine=${engine} listener=${listener} edge_probe=${edge_probe:-0} edge_ms=${edge_ms:-0}"
+    cat <<JSON
+{
+  "ok": true,
+  "codespace": "$(json_escape "$CODESPACE_NAME")",
+  "domain": "$(json_escape "$PORT_DOMAIN")",
+  "port": ${doctor_port},
+  "engine_running": ${engine},
+  "listener_open": ${listener},
+  "config_present": $([[ -f "$CONFIG_FILE" ]] && printf true || printf false),
+  "local_probe": {"http_status": ${local_probe:-0}, "latency_ms": ${local_ms:-0}, "usable": $(xhttp_status_usable "$local_probe" && printf true || printf false)},
+  "edge_probe": {"http_status": ${edge_probe:-0}, "latency_ms": ${edge_ms:-0}, "usable": $(xhttp_status_usable "$edge_probe" && printf true || printf false)},
+  "supervisor": "$(json_escape "$supervisor")",
+  "last_good_route": "$(json_escape "$last_good")",
+  "waker_configured": $([[ -n "$waker_url" ]] && printf true || printf false),
+  "log_file": "$(json_escape "$LOG_FILE")",
+  "structured_log_file": "$(json_escape "$STRUCTURED_LOG_FILE")",
+  "diagnostic_log_file": "$(json_escape "$DIAGNOSTIC_LOG_FILE")"
+}
+JSON
+}
+
+if [[ "${G2RAY_SOURCE_ONLY:-}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+if [[ "${1:-}" == "--doctor-json" || "${1:-}" == "--status-json" || ( "${1:-}" == "doctor" && "${2:-}" == "--json" ) ]]; then
+    print_doctor_json
+    exit 0
+fi
+
+if [[ "${1:-}" == "--recover-now" || "${1:-}" == "recover" ]]; then
+    recover_now --no-prompt
+    exit $?
+fi
+
 if [[ "${1:-}" == "--silent-start" ]]; then
     ensure_runtime_ready "silent_start" >/dev/null 2>&1 || true
     start_background_tasks
@@ -1985,6 +2769,8 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "\n  ${GREEN}✔ Setup complete!${NC}"
         sleep 1
         maybe_prompt_waker_setup
+        show_recovery_command_card
+        show_diagnostics
     else
         exit 0
     fi
@@ -2017,7 +2803,7 @@ while true; do
     echo -e "  ${WHITE}${B}● CORE CONTROLS${NC}"
     echo -e "   ${RED}1)${NC} View Config & QR Code       ${RED}4)${NC} Stop Engine"
     echo -e "   ${RED}2)${NC} Generate New Config         ${RED}5)${NC} Restart Engine"
-    echo -e "   ${RED}3)${NC} Start Engine                ${RED}6)${NC} Force Reconnect"
+    echo -e "   ${RED}3)${NC} Start Engine                ${RED}6)${NC} Recover Now"
     echo ""
     echo -e "  ${WHITE}${B}● SYSTEM CONFIGURATION${NC}"
     echo -e "   ${RED}7)${NC} Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))"
@@ -2027,7 +2813,8 @@ while true; do
     echo -e "   ${RED}9)${NC} Data Usage                 ${RED}12)${NC} Server Location"
     echo -e "  ${RED}10)${NC} Resource Stats             ${RED}13)${NC} View Engine Logs"
     echo -e "  ${RED}14)${NC} Diagnostics                ${RED}15)${NC} Recovery / Waker Setup"
-    echo -e "  ${RED}11)${NC} Quota & Uptime"
+    echo -e "  ${RED}11)${NC} Quota & Uptime             ${RED}16)${NC} Live Monitor"
+    echo -e "                                      ${RED}17)${NC} Route Candidates"
     echo ""
     echo -e "   ${RED}0)${NC} Exit Panel"
     echo -e "  ${DIM}───────────────────────────────────────────────────────────${NC}"
@@ -2147,7 +2934,7 @@ while true; do
             fi
             sleep 1
             ;;
-        6) force_reconnect ;;
+        6) recover_now ;;
         7)
             if tmux has-session -t g2ray_keepalive 2>/dev/null; then
                 tmux kill-session -t g2ray_keepalive
@@ -2220,6 +3007,8 @@ while true; do
             ;;
         14) show_diagnostics ;;
         15) show_recovery_waker ;;
+        16) show_live_monitor ;;
+        17) show_route_candidate_manager ;;
         0) echo -e "\n  ${GREEN}Exiting G2ray Panel...${NC}"; exit 0 ;;
         *) echo -e "  ${RED}✖ Invalid option.${NC}"; sleep 1 ;;
     esac
