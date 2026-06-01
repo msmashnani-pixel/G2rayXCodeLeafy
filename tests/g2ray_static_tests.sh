@@ -152,7 +152,21 @@ test_generated_files_are_ignored() {
     for pattern in '/configs-to-copy-for-mobile.txt.*' '/configs-subscription-base64.txt.*'; do
         grep_fixed "$pattern" "$GITIGNORE" || fail ".gitignore missing atomic temp pattern $pattern"
     done
+    grep_fixed '/g2ray-support-*.tar.gz' "$GITIGNORE" \
+        || fail '.gitignore missing support bundle archive pattern'
     pass 'generated runtime files are ignored'
+}
+
+test_support_bundle_has_safe_entrypoint() {
+    grep_fixed 'create_support_bundle()' "$SCRIPT" \
+        || fail 'script does not provide a support bundle creator'
+    grep_fixed 'redact_sensitive_text()' "$SCRIPT" \
+        || fail 'support bundle creator has no redaction helper'
+    grep_fixed '--support-bundle' "$SCRIPT" \
+        || fail 'script does not expose support bundle creation as a headless command'
+    grep_fixed 'Sensitive VLESS links, UUIDs, bearer tokens, GitHub tokens, and wake secrets are redacted.' "$SCRIPT" \
+        || fail 'support bundle metadata does not explain redaction'
+    pass 'support bundle has safe headless entrypoint'
 }
 
 test_shell_files_are_lf_normalized() {
@@ -161,6 +175,8 @@ test_shell_files_are_lf_normalized() {
         || fail '.gitattributes does not force shell scripts to LF'
     grep_fixed '*.ps1 text eol=lf' "$GITATTRIBUTES" \
         || fail '.gitattributes does not force PowerShell helper scripts to LF'
+    grep_fixed '*.mjs text eol=lf' "$GITATTRIBUTES" \
+        || fail '.gitattributes does not force Node ESM test scripts to LF'
     grep_fixed 'tests/*.sh text eol=lf' "$GITATTRIBUTES" \
         || fail '.gitattributes does not force test shell scripts to LF'
     pass 'shell files are LF-normalized for Linux Bash'
@@ -691,6 +707,10 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker dashboard does not compute history summary metrics'
     grep_fixed 'History request failed:' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard hides unauthorized or failed history requests'
+    grep_fixed 'securityHeaders(' "$WORKER_SCRIPT" \
+        || fail 'Worker responses do not share hardened security headers'
+    grep_fixed 'ctx.waitUntil' "$WORKER_SCRIPT" \
+        || fail 'Worker does not defer notification side effects with waitUntil'
     grep_fixed 'WAKER_KV' "$WORKER_README" \
         || fail 'Worker README does not document optional KV history'
     grep_fixed 'DISCORD_WEBHOOK_URL' "$WORKER_README" \
@@ -836,6 +856,8 @@ test_first_run_recovery_card_is_present() {
         || fail 'recovery command card does not show doctor JSON command'
     grep_fixed 'bash ./g2ray.sh --recover-now' "$SCRIPT" \
         || fail 'recovery command card does not show recover command'
+    grep_fixed 'bash ./g2ray.sh --recover-now --json' "$SCRIPT" \
+        || fail 'recovery command card does not show machine-readable recover command'
     grep_fixed 'replace <WAKE_SECRET>' "$SCRIPT" \
         || fail 'recovery command card does not avoid printing the raw wake secret'
     grep_fixed 'copy these recovery commands' "$README" \
@@ -848,6 +870,10 @@ test_soft_recovery_and_route_memory_are_present() {
         || fail 'panel has no idempotent soft recovery path'
     grep_fixed 'recover_now --no-prompt' "$SCRIPT" \
         || fail 'headless recover command is not wired'
+    grep_fixed 'recover_now_json()' "$SCRIPT" \
+        || fail 'machine-readable recover JSON renderer is missing'
+    grep_fixed 'recover_now --no-prompt >/dev/null 2>&1' "$SCRIPT" \
+        || fail 'machine-readable recover command does not suppress human terminal output'
     grep_fixed '--doctor-json' "$SCRIPT" \
         || fail 'panel has no headless doctor JSON command'
     grep_fixed 'print_doctor_json()' "$SCRIPT" \
@@ -1325,6 +1351,15 @@ test_menu_loop_and_link_output_are_tidy() {
         || fail 'wait_for_port does not show elapsed initialization time'
     grep_fixed 'Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))' "$SCRIPT" \
         || fail 'anti-sleep toggle menu item does not show the current state inline'
+    if awk '
+        /case \$_choice in/ { in_menu=1; next }
+        in_menu && /^[[:space:]]*1\)/ { in_config=1; next }
+        in_config && /^[[:space:]]*2\)/ { exit }
+        in_config && /ipinfo\.io/ { found=1; exit }
+        END { exit found ? 0 : 1 }
+    ' "$SCRIPT"; then
+        fail 'config/QR screen still performs a slow external ipinfo lookup'
+    fi
     pass 'menu loop and link output are tidy'
 }
 
@@ -1351,6 +1386,7 @@ test_port_visibility_failures_are_handled
 test_self_update_is_opt_in
 test_exit_trap_preserves_failures
 test_generated_files_are_ignored
+test_support_bundle_has_safe_entrypoint
 test_shell_files_are_lf_normalized
 test_panel_script_is_executable
 test_xray_version_can_be_pinned

@@ -837,6 +837,8 @@ show_recovery_command_card() {
     echo -e "  ${WHITE}${B}copy these recovery commands${NC}"
     echo -e "  ${GREEN}bash ./g2ray.sh --doctor-json${NC}"
     echo -e "  ${GREEN}bash ./g2ray.sh --recover-now${NC}"
+    echo -e "  ${GREEN}bash ./g2ray.sh --recover-now --json${NC}"
+    echo -e "  ${GREEN}bash ./g2ray.sh --support-bundle${NC}"
     if [[ -n "$worker_url" ]]; then
         echo -e "  ${GREEN}curl -X POST -H \"Authorization: Bearer <WAKE_SECRET>\" \"${worker_url}\"${NC}"
         echo -e "  ${DIM}For PowerShell, keep the URL the same and replace <WAKE_SECRET> manually.${NC}"
@@ -2329,6 +2331,83 @@ log_diagnostic_snapshot() {
     chmod 600 "$DIAGNOSTIC_LOG_FILE" 2>/dev/null || true
 }
 
+redact_sensitive_text() {
+    sed -E \
+        -e "s#vless://[^[:space:]\"'{},]+#<vless-redacted>#g" \
+        -e "s#(\"?authorization\"?[[:space:]]*:[[:space:]]*\"?bearer[[:space:]]+)[^\"'[:space:],}]+#\\1<bearer-redacted>#Ig" \
+        -e "s#(\"?GITHUB_TOKEN\"?[[:space:]]*[:=][[:space:]]*\"?)[^\"'[:space:],}]+#\\1<github-token-redacted>#Ig" \
+        -e "s#(\"?WAKE_SECRET\"?[[:space:]]*[:=][[:space:]]*\"?)[^\"'[:space:],}]+#\\1<wake-secret-redacted>#Ig" \
+        -e "s#(\"?wake_secret\"?[[:space:]]*[:=][[:space:]]*\"?)[^\"'[:space:],}]+#\\1<wake-secret-redacted>#Ig" \
+        -e 's#github_pat_[A-Za-z0-9_]+#github_pat_<redacted>#g' \
+        -e 's#gh[pousr]_[A-Za-z0-9_]+#gh_<redacted>#g' \
+        -e 's#[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}#<uuid-redacted>#g' \
+        -e 's#(^|[^0-9A-Fa-f])([0-9A-Fa-f]{48,})([^0-9A-Fa-f]|$)#\1<hex-secret-redacted>\3#g'
+}
+
+copy_redacted_file() {
+    local src="$1" dst="$2"
+    mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+    if [[ -f "$src" ]]; then
+        redact_sensitive_text < "$src" > "$dst" 2>/dev/null || return 1
+    else
+        printf 'missing: %s\n' "$src" > "$dst"
+    fi
+    chmod 600 "$dst" 2>/dev/null || true
+}
+
+create_support_bundle() {
+    local ts out tmp git_rev xray_ver
+    ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%dT%H%M%S')
+    out="${1:-$LOG_DIR/g2ray-support-${ts}.tar.gz}"
+    tmp=$(mktemp -d "$DATA_DIR/support-bundle.XXXXXX") || return 1
+    mkdir -p "$tmp/logs" "$tmp/state" "$tmp/runtime" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+
+    git_rev=$(git -C "$BASE_DIR" log --oneline -1 2>/dev/null || printf 'unknown')
+    xray_ver="unknown"
+    if [[ -x "$XRAY_BIN" ]]; then
+        xray_ver=$("$XRAY_BIN" version 2>/dev/null | head -1 || true)
+        [[ -n "$xray_ver" ]] || xray_ver="unknown"
+    fi
+    {
+        printf 'created_at=%s\n' "$ts"
+        printf 'project=%s\n' "$PROJECT_REPO"
+        printf 'git=%s\n' "$git_rev"
+        printf 'codespace=%s\n' "$CODESPACE_NAME"
+        printf 'domain=%s\n' "$PORT_DOMAIN"
+        printf 'port=%s\n' "$XRAY_PORT"
+        printf 'xray=%s\n' "$xray_ver"
+        printf 'note=Sensitive VLESS links, UUIDs, bearer tokens, GitHub tokens, and wake secrets are redacted.\n'
+    } | redact_sensitive_text > "$tmp/metadata.txt"
+
+    print_doctor_json | redact_sensitive_text > "$tmp/doctor.json" 2>/dev/null || printf '{}\n' > "$tmp/doctor.json"
+    copy_redacted_file "$LOG_FILE" "$tmp/logs/g2ray.log"
+    copy_redacted_file "$STRUCTURED_LOG_FILE" "$tmp/logs/g2ray-events.jsonl"
+    copy_redacted_file "$DIAGNOSTIC_LOG_FILE" "$tmp/logs/g2ray-diagnostics.log"
+    copy_redacted_file "$LOG_DIR/xray.log" "$tmp/logs/xray.log"
+    copy_redacted_file "$LOG_DIR/xray-error.log" "$tmp/logs/xray-error.log"
+    copy_redacted_file "$ROUTE_HEALTH_FILE" "$tmp/state/route_candidate_health.tsv"
+    copy_redacted_file "$LAST_GOOD_ROUTE_FILE" "$tmp/state/last_good_route.txt"
+    copy_redacted_file "$ROUTE_SETTLING_HISTORY_FILE" "$tmp/state/route_settling_history.tsv"
+    copy_redacted_file "$PINNED_ROUTE_FILE" "$tmp/state/pinned_route.txt"
+    copy_redacted_file "$MANUAL_ROUTE_CANDIDATES_FILE" "$tmp/state/manual_route_candidates.txt"
+    copy_redacted_file "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$tmp/state/blacklisted_route_candidates.txt"
+    copy_redacted_file "$WAKER_METADATA_FILE" "$tmp/state/waker_metadata.txt"
+    route_candidate_health_summary | redact_sensitive_text > "$tmp/runtime/route_candidates.txt" 2>/dev/null || true
+    route_settling_history_summary | redact_sensitive_text > "$tmp/runtime/route_settling_summary.txt" 2>/dev/null || true
+    last_known_state_summary | redact_sensitive_text > "$tmp/runtime/last_known_state.txt" 2>/dev/null || true
+
+    mkdir -p "$(dirname "$out")" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+    if (cd "$tmp" && tar -czf "$out" .); then
+        chmod 600 "$out" 2>/dev/null || true
+        rm -rf "$tmp"
+        log_event INFO "support_bundle created path=${out}"
+        printf '%s\n' "$out"
+        return 0
+    fi
+    rm -rf "$tmp"
+    return 1
+}
+
 show_diagnostics() {
     refresh_screen
     log_event INFO "diagnostics opened"
@@ -2563,6 +2642,47 @@ recover_now() {
     return "$failed"
 }
 
+recover_now_json() {
+    local rc=0 xcode=0 xms=0 route_ready=false engine=false listener=false status next_action ok_bool=false
+    if recover_now --no-prompt >/dev/null 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    read -r xcode xms < <(xhttp_probe_metrics external)
+    if xhttp_status_usable "$xcode"; then
+        route_ready=true
+        status="ready"
+        next_action="Try the same VLESS config again."
+    elif [[ "$xcode" == "404" ]]; then
+        status="settling"
+        next_action="Wait and retry health, or open the panel and run Recover Now if it stays stuck."
+    else
+        status="failed"
+        next_action="Open diagnostics and inspect the support bundle logs."
+    fi
+    xray_running && engine=true
+    is_port_open && listener=true
+    [[ "$route_ready" == true && "$rc" -eq 0 ]] && ok_bool=true
+    log_event INFO "recover_now_json requested ok=${ok_bool} status=${status} route_ready=${route_ready} xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} rc=${rc}"
+    cat <<JSON
+{
+  "ok": ${ok_bool},
+  "status": "$(json_escape "$status")",
+  "route_ready": ${route_ready},
+  "engine_running": ${engine},
+  "listener_open": ${listener},
+  "edge_probe": {"http_status": ${xcode:-0}, "latency_ms": ${xms:-0}, "usable": $(xhttp_status_usable "$xcode" && printf true || printf false)},
+  "exit_code": ${rc},
+  "next_action": "$(json_escape "$next_action")",
+  "log_file": "$(json_escape "$LOG_FILE")",
+  "structured_log_file": "$(json_escape "$STRUCTURED_LOG_FILE")",
+  "diagnostic_log_file": "$(json_escape "$DIAGNOSTIC_LOG_FILE")"
+}
+JSON
+    return "$rc"
+}
+
 force_reconnect() {
     local no_prompt="${1:-}" failed=0 expose_failed=false hard_failed=false
     log_event INFO "force_reconnect begin no_prompt=${no_prompt:-false}"
@@ -2748,6 +2868,16 @@ if [[ "${1:-}" == "--doctor-json" || "${1:-}" == "--status-json" || ( "${1:-}" =
     exit 0
 fi
 
+if [[ "${1:-}" == "--support-bundle" || "${1:-}" == "support-bundle" ]]; then
+    create_support_bundle
+    exit $?
+fi
+
+if [[ ( "${1:-}" == "--recover-now" || "${1:-}" == "recover" ) && "${2:-}" == "--json" ]]; then
+    recover_now_json
+    exit $?
+fi
+
 if [[ "${1:-}" == "--recover-now" || "${1:-}" == "recover" ]]; then
     recover_now --no-prompt
     exit $?
@@ -2918,11 +3048,7 @@ while true; do
             echo -e "  ${DIM}QR PNG files are saved under ${QR_DIR}.${NC}"
             echo -e "  ${DIM}If phone QR scanning fails, open the PNG, import the copy-ready link, or${NC}"
             echo -e "  ${DIM}${MOBILE_CONFIG_FILE} instead. Terminal zoom/theme can make QR scanning unreliable.${NC}\n"
-            _COUNTRY=$(curl -s --max-time 3 https://ipinfo.io/country </dev/null 2>/dev/null || echo "Unknown")
-            if [[ "$_COUNTRY" != "DE" && "$_COUNTRY" != "NL" && "$_COUNTRY" != "Unknown" ]]; then
-                echo -e "  ${RED}WARNING: Codespace is NOT in Germany (${_COUNTRY})!${NC}"
-                echo -e "  ${DIM}Set region to 'Europe West' in GitHub for optimal speeds.${NC}\n"
-            fi
+            echo -e "  ${DIM}For exit location details, use option 12) Server Location.${NC}\n"
             echo -e "  ${DIM}Not working? Visit:${NC} ${GREEN}https://code-leafy.github.io/NetLeafy${NC}\n"
             echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
             ;;

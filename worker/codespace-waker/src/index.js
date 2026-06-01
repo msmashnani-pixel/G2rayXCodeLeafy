@@ -56,13 +56,14 @@ async function handleWake(request, env, ctx) {
     ...event,
     history_recorded_at: new Date().toISOString()
   });
-  const notificationErrors = await sendNotifications(env, event);
+  const notifications = await queueNotifications(env, event, ctx);
 
   return json({
     ...data,
     history_enabled: Boolean(env.WAKER_KV),
     history_recorded: historyRecorded,
-    notification_errors: notificationErrors
+    notifications_deferred: notifications.deferred,
+    notification_errors: notifications.errors
   }, responseStatusFor(data));
 }
 
@@ -85,13 +86,14 @@ async function handleHealth(request, env, ctx) {
     ...event,
     history_recorded_at: new Date().toISOString()
   });
-  const notificationErrors = await sendNotifications(env, event);
+  const notifications = await queueNotifications(env, event, ctx);
 
   return json({
     ...data,
     history_enabled: Boolean(env.WAKER_KV),
     history_recorded: historyRecorded,
-    notification_errors: notificationErrors
+    notifications_deferred: notifications.deferred,
+    notification_errors: notifications.errors
   }, responseStatusFor(data));
 }
 
@@ -573,6 +575,26 @@ async function sendNotifications(env, event) {
   return results.filter(Boolean);
 }
 
+async function queueNotifications(env, event, ctx) {
+  if (!shouldNotify(event)) return { deferred: false, errors: [] };
+
+  const task = sendNotifications(env, event).then((errors) => {
+    if (errors.length) {
+      console.warn("notification_errors", errors.join(","));
+    }
+    return errors;
+  });
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(task.catch((error) => {
+      console.warn("notification_failed", shortError(error));
+    }));
+    return { deferred: true, errors: [] };
+  }
+
+  return { deferred: false, errors: await task };
+}
+
 function shouldNotify(event) {
   if (event.reason === "github_token_rejected_or_missing_scope") return true;
   if (event.kind !== "wake") return false;
@@ -745,21 +767,35 @@ function sleep(ms) {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: {
+    headers: securityHeaders({
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store"
-    }
+    }, "json")
   });
 }
 
 function html(markup, status = 200) {
   return new Response(markup, {
     status,
-    headers: {
+    headers: securityHeaders({
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store"
-    }
+    }, "html")
   });
+}
+
+function securityHeaders(headers, kind) {
+  const csp = kind === "html"
+    ? "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+    : "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+  return {
+    ...headers,
+    "content-security-policy": csp,
+    "permissions-policy": "camera=(), geolocation=(), microphone=()",
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY"
+  };
 }
 
 function renderDashboard() {

@@ -217,6 +217,72 @@ async function testHistoryRejectsBadSecretClearly() {
   console.log("PASS: Worker history rejects bad wake secret clearly");
 }
 
+async function testResponsesIncludeSecurityHeaders() {
+  const htmlResponse = await worker.fetch(new Request("https://worker.example/wake"), baseEnv(), {});
+  assert.equal(htmlResponse.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(htmlResponse.headers.get("referrer-policy"), "no-referrer");
+  assert.equal(htmlResponse.headers.get("x-frame-options"), "DENY");
+  assert.match(htmlResponse.headers.get("content-security-policy") || "", /frame-ancestors 'none'/);
+
+  const jsonResponse = await worker.fetch(makeRequest("/api/history", "wrong-secret"), baseEnv(), {});
+  assert.equal(jsonResponse.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(jsonResponse.headers.get("referrer-policy"), "no-referrer");
+  assert.match(jsonResponse.headers.get("content-security-policy") || "", /default-src 'none'/);
+  console.log("PASS: Worker responses include security headers");
+}
+
+async function testWakeQueuesNotificationsWithWaitUntil() {
+  let routeCalls = 0;
+  let notificationCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ state: "Available" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    if (url.includes("discord.example")) {
+      notificationCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const waitUntilPromises = [];
+  const response = await worker.fetch(
+    makeRequest("/api/wake"),
+    baseEnv({ DISCORD_WEBHOOK_URL: "https://discord.example/hook" }),
+    { waitUntil(promise) { waitUntilPromises.push(promise); } }
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.route_ready, true);
+  assert.equal(body.notifications_deferred, true);
+  assert.deepEqual(body.notification_errors, []);
+  assert.equal(waitUntilPromises.length, 1);
+  await Promise.all(waitUntilPromises);
+  assert.equal(routeCalls >= 2, true);
+  assert.equal(notificationCalls, 1);
+  console.log("PASS: Worker queues notifications with waitUntil");
+}
+
 try {
   await testFailedSecretRateLimit();
   await testGithubRateLimitClassification();
@@ -226,6 +292,8 @@ try {
   await testWakeRequiresStableRouteReadiness();
   await testDashboardIncludesRouteHistorySummaryUi();
   await testHistoryRejectsBadSecretClearly();
+  await testResponsesIncludeSecurityHeaders();
+  await testWakeQueuesNotificationsWithWaitUntil();
 } finally {
   globalThis.fetch = originalFetch;
 }

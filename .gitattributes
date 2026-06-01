@@ -6,6 +6,7 @@ tests/*.sh text eol=lf
 *.txt text eol=lf
 *.json text eol=lf
 *.js text eol=lf
+*.mjs text eol=lf
 *.toml text eol=lf
 *.toml.example text eol=lf
 *.yml text eol=lf

@@ -319,6 +319,7 @@ test_doctor_json_sanitizes_invalid_port() {
 
 test_route_wait_requires_stable_usable_probes() {
     reset_runtime_paths
+    ROUTE_READY_STABLE_SLEEP_SEC=0
     local probes=0
     xhttp_probe_metrics() {
         probes=$((probes + 1))
@@ -375,6 +376,61 @@ test_recover_now_success_clears_nonfatal_port_public_failure() {
     pass "recover now returns success when route recovers despite nonfatal port-public failure"
 }
 
+test_recover_now_json_reports_ready_contract() {
+    (
+        reset_runtime_paths
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        xray_listener_ready() { return 0; }
+        ensure_codespace_port_public() { return 0; }
+        wait_for_xhttp_route_ready() { return 0; }
+        xhttp_probe_metrics() { printf '200 7\n'; }
+        refresh_route_candidate_health() { return 0; }
+        refresh_config_exports() { return 0; }
+        log_diagnostic_snapshot() { return 0; }
+        output="$(recover_now_json)"
+        rc=$?
+        [[ "$rc" -eq 0 ]] || fail "ready recover_now_json returned $rc"
+        python -m json.tool <<< "$output" >/dev/null || fail "recover_now_json returned invalid JSON"
+        grep -Fq '"ok": true' <<< "$output" || fail "recover_now_json did not report ok=true"
+        grep -Fq '"status": "ready"' <<< "$output" || fail "recover_now_json did not report ready status"
+        grep -Fq '"route_ready": true' <<< "$output" || fail "recover_now_json did not report route_ready=true"
+        grep -Fq '"edge_probe": {"http_status": 200' <<< "$output" || fail "recover_now_json missing edge probe status"
+    )
+    pass "recover now json reports ready contract"
+}
+
+test_recover_now_json_reports_settling_contract() {
+    (
+        reset_runtime_paths
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        xray_listener_ready() { return 0; }
+        ensure_codespace_port_public() { return 0; }
+        wait_for_xhttp_route_ready() { return 1; }
+        repair_codespace_port_route() { return 0; }
+        xhttp_probe_metrics() { printf '404 33\n'; }
+        refresh_route_candidate_health() { return 0; }
+        refresh_config_exports() { return 0; }
+        log_diagnostic_snapshot() { return 0; }
+        if output="$(recover_now_json)"; then
+            fail "settling recover_now_json returned success"
+        else
+            rc=$?
+        fi
+        [[ "$rc" -ne 0 ]] || fail "settling recover_now_json returned zero"
+        python -m json.tool <<< "$output" >/dev/null || fail "settling recover_now_json returned invalid JSON"
+        grep -Fq '"ok": false' <<< "$output" || fail "recover_now_json did not report ok=false while settling"
+        grep -Fq '"status": "settling"' <<< "$output" || fail "recover_now_json did not report settling status"
+        grep -Fq '"route_ready": false' <<< "$output" || fail "recover_now_json did not report route_ready=false"
+        grep -Fq '"next_action": "Wait and retry health, or open the panel and run Recover Now if it stays stuck."' <<< "$output" \
+            || fail "recover_now_json missing settling next action"
+    )
+    pass "recover now json reports settling contract"
+}
+
 test_diagnostic_snapshot_writes_readable_history() {
     reset_runtime_paths
     CODESPACE_NAME="behavior-space"
@@ -398,6 +454,74 @@ test_diagnostic_snapshot_writes_readable_history() {
     pass "diagnostic snapshots persist readable history"
 }
 
+test_structured_log_jsonl_is_parseable_with_special_chars() {
+    reset_runtime_paths
+    log_event INFO $'route_unusable detail="bad route" path=C:\\tmp\\x\nnext-line'
+    log_event WARN "fallback_route_unusable ip=20.0.0.1 xhttp_probe=404"
+    python - "$STRUCTURED_LOG_FILE" <<'PY' || fail "structured event log contains invalid JSONL"
+import json
+import sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    rows = [json.loads(line) for line in fh if line.strip()]
+assert len(rows) == 2
+for row in rows:
+    assert {"ts", "level", "event", "message"} <= set(row)
+    assert "\n" not in row["message"]
+assert rows[0]["event"] == "route_unusable"
+assert rows[1]["event"] == "fallback_route_unusable"
+PY
+    pass "structured log JSONL stays parseable with special characters"
+}
+
+test_support_bundle_redacts_sensitive_material() {
+    reset_runtime_paths
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    XRAY_PORT=443
+    local uuid="11111111-2222-3333-4444-555555555555"
+    local bearer="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    local github_token="github_pat_1234567890_SECRET_TOKEN"
+    local classic_token="gho_SECRET_TOKEN"
+    local fine_grained_token="github_pat_1234567890_SECRET_TOKEN"
+    local vless="vless://${uuid}@behavior-space-443.app.github.dev:443?encryption=none#label"
+    printf '%s\nAuthorization: Bearer %s\nauthorization: Bearer %s\nGITHUB_TOKEN=%s\n"WAKE_SECRET":"%s"\nclassic=%s\nfine=%s\n' \
+        "$vless" "$bearer" "$bearer" "$github_token" "$bearer" "$classic_token" "$fine_grained_token" > "$LOG_FILE"
+    printf '{"ts":"2026-05-30T00:00:00Z","level":"INFO","event":"test","message":"%s","authorization":"Bearer %s","WAKE_SECRET":"%s","token":"%s"}\n' \
+        "$vless" "$bearer" "$bearer" "ghs_SECRET_TOKEN" > "$STRUCTURED_LOG_FILE"
+    printf 'wake_secret=%s\n%s\n"authorization":"Bearer %s"\n' "$bearer" "$uuid" "$bearer" > "$DIAGNOSTIC_LOG_FILE"
+    printf 'worker_url=https://worker.example/wake\nwake_secret=%s\nGITHUB_TOKEN=%s\n' "$bearer" "ghr_SECRET_TOKEN" > "$WAKER_METADATA_FILE"
+    printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t10\ttrue\n' > "$ROUTE_HEALTH_FILE"
+    printf 'ip=20.0.0.1\nchecked_at=2026-05-30T00:00:00Z\n' > "$LAST_GOOD_ROUTE_FILE"
+    XRAY_BIN="$TMP_ROOT/missing-xray"
+    xray_running() { return 0; }
+    is_port_open() { return 0; }
+    xhttp_probe_metrics() { printf '200 1\n'; }
+    background_supervisor_status() { printf 'pid=1 running=heartbeat version=ok token=present heartbeat_age=1s\n'; }
+
+    local bundle extract
+    bundle="$(create_support_bundle)" || fail "support bundle creation failed"
+    [[ -s "$bundle" ]] || fail "support bundle archive is missing"
+    extract="$TMP_ROOT/support-extract"
+    mkdir -p "$extract"
+    tar -xzf "$bundle" -C "$extract"
+    [[ -s "$extract/doctor.json" ]] || fail "support bundle missing doctor JSON"
+    [[ -s "$extract/logs/g2ray.log" ]] || fail "support bundle missing redacted app log"
+    if grep -R -Fq "$uuid" "$extract" || grep -R -Fq "$bearer" "$extract" || grep -R -Fq "$github_token" "$extract" || grep -R -Fq "$classic_token" "$extract" || grep -R -Fq "$fine_grained_token" "$extract" || grep -R -Fq "$vless" "$extract"; then
+        fail "support bundle leaked sensitive material"
+    fi
+    grep -R -Fq '<vless-redacted>' "$extract" || fail "support bundle did not mark redacted VLESS links"
+    python - "$extract/logs/g2ray-events.jsonl" <<'PY' || fail "support bundle redaction corrupted structured JSONL"
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    rows = [json.loads(line) for line in fh if line.strip()]
+assert rows
+PY
+    grep -Fq 'xray=unknown' "$extract/metadata.txt" || fail "support bundle did not survive missing Xray binary"
+    pass "support bundle redacts sensitive material"
+}
+
 test_port_visibility_is_throttled
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_cached_route_order_prefers_last_good_then_latency
@@ -415,4 +539,8 @@ test_doctor_json_sanitizes_invalid_port
 test_route_wait_requires_stable_usable_probes
 test_route_wait_rejects_transient_single_success
 test_recover_now_success_clears_nonfatal_port_public_failure
+test_recover_now_json_reports_ready_contract
+test_recover_now_json_reports_settling_contract
 test_diagnostic_snapshot_writes_readable_history
+test_structured_log_jsonl_is_parseable_with_special_chars
+test_support_bundle_redacts_sensitive_material
