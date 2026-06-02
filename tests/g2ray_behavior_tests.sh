@@ -34,6 +34,7 @@ reset_runtime_paths() {
     BLACKLISTED_ROUTE_CANDIDATES_FILE="$DATA_DIR/blacklisted_route_candidates.txt"
     ROUTE_SETTLING_HISTORY_FILE="$DATA_DIR/route_settling_history.tsv"
     PORT_PUBLIC_STAMP_FILE="$DATA_DIR/port_public_last"
+    RUNTIME_LOCK_DIR="$DATA_DIR/runtime.lock"
     LOG_FILE="$LOG_DIR/g2ray.log"
     STRUCTURED_LOG_FILE="$LOG_DIR/g2ray-events.jsonl"
     DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
@@ -76,6 +77,57 @@ test_port_visibility_is_throttled() {
     calls=$(wc -l < "$calls_file" | tr -d ' ')
     [[ "$calls" -eq 2 ]] || fail "expected forced port visibility to call gh again, got $calls"
     pass "port visibility calls are throttled and forceable"
+}
+
+test_runtime_lock_serializes_operations_and_allows_reentry() {
+    reset_runtime_paths
+    RUNTIME_LOCK_WAIT_ATTEMPTS=1
+    local owner_pid
+    sleep 10 &
+    owner_pid=$!
+    mkdir -p "$RUNTIME_LOCK_DIR"
+    printf '%s\n' "$owner_pid" > "$RUNTIME_LOCK_DIR/pid"
+    local ran_file="$TMP_ROOT/runtime-lock-ran.txt"
+    runtime_lock_probe() { printf 'ran\n' > "$ran_file"; }
+
+    if with_runtime_lock runtime_lock_probe; then
+        kill "$owner_pid" 2>/dev/null || true
+        fail "runtime lock allowed operation while a live owner held the lock"
+    fi
+    kill "$owner_pid" 2>/dev/null || true
+    [[ ! -e "$ran_file" ]] || fail "runtime operation ran while lock was busy"
+
+    rm -rf "$RUNTIME_LOCK_DIR"
+    mkdir -p "$RUNTIME_LOCK_DIR"
+    printf '%s\n' "$$" > "$RUNTIME_LOCK_DIR/pid"
+    with_runtime_lock runtime_lock_probe || fail "runtime lock did not clean up stale same-process lock"
+    grep -Fxq 'ran' "$ran_file" || fail "runtime operation did not run after stale same-process lock cleanup"
+    [[ ! -d "$RUNTIME_LOCK_DIR" ]] || fail "runtime lock was not released after successful command"
+    rm -f "$ran_file"
+
+    rm -rf "$RUNTIME_LOCK_DIR"
+    runtime_lock_inner() { printf 'inner\n' > "$ran_file"; }
+    runtime_lock_outer() { with_runtime_lock runtime_lock_inner; }
+    with_runtime_lock runtime_lock_outer || fail "runtime lock was not reentrant for nested runtime operations"
+    grep -Fxq 'inner' "$ran_file" || fail "nested runtime operation did not run"
+    [[ ! -d "$RUNTIME_LOCK_DIR" ]] || fail "runtime lock was not released after nested successful command"
+
+    rm -rf "$RUNTIME_LOCK_DIR"
+    runtime_lock_assert_held_and_fail() {
+        [[ -d "$RUNTIME_LOCK_DIR" ]] || fail "runtime lock was not held while command ran"
+        [[ "$(cat "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true)" == "$$" ]] || fail "runtime lock owner was not current shell"
+        return 7
+    }
+    local rc=0
+    if with_runtime_lock runtime_lock_assert_held_and_fail; then
+        fail "runtime lock wrapper swallowed command failure"
+    else
+        rc=$?
+    fi
+    [[ "$rc" -eq 7 ]] || fail "runtime lock wrapper did not preserve command failure status, got $rc"
+    [[ ! -d "$RUNTIME_LOCK_DIR" ]] || fail "runtime lock was not released after a failing command"
+
+    pass "runtime lock serializes operations and allows same-process reentry"
 }
 
 test_port_visibility_cache_is_scoped_by_codespace_and_port() {
@@ -308,6 +360,31 @@ EOF
     mapfile -t routes < <(usable_fallback_ips)
     [[ "${routes[*]}" == "20.0.0.5 20.0.0.6" ]] || fail "usable_fallback_ips did not return cached usable routes"
     pass "usable fallback exports use fresh cached route health"
+}
+
+test_usable_fallback_ips_caps_live_probe_fallback() {
+    reset_runtime_paths
+    MAX_FALLBACK_LINKS=1
+    ROUTE_MONITOR_MAX_CANDIDATES=3
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    refresh_route_candidate_health() { return 0; }
+    resolve_domain_ips() {
+        for i in $(seq 1 12); do
+            printf '20.0.0.%s\n' "$i"
+        done
+    }
+    local probes_file="$TMP_ROOT/live-fallback-probes.txt"
+    : > "$probes_file"
+    xhttp_probe_metrics() {
+        printf 'probe\n' >> "$probes_file"
+        printf '404 50\n'
+    }
+
+    usable_fallback_ips >/dev/null || true
+    local probes
+    probes=$(wc -l < "$probes_file" | tr -d ' ')
+    [[ "$probes" -eq 3 ]] || fail "live fallback probe path was not capped at route monitor max; got $probes"
+    pass "usable fallback live probes are bounded by route monitor cap"
 }
 
 test_route_settling_history_records_summary() {
@@ -679,6 +756,7 @@ test_support_bundle_marks_unreadable_optional_logs() {
 }
 
 test_port_visibility_is_throttled
+test_runtime_lock_serializes_operations_and_allows_reentry
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_cached_route_order_uses_reliability_then_average_latency
 test_route_candidate_stats_track_average_and_success_rate
@@ -691,6 +769,7 @@ test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source
 test_last_known_state_scans_full_current_log
 test_usable_fallback_ips_uses_fresh_cache
+test_usable_fallback_ips_caps_live_probe_fallback
 test_route_settling_history_records_summary
 test_doctor_json_reports_probe_state
 test_doctor_json_sanitizes_invalid_port

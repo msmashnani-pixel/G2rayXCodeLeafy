@@ -620,8 +620,12 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker does not redact GitHub error response details'
     grep_fixed 'idle_timeout_minutes:' "$WORKER_SCRIPT" \
         || fail 'Worker success response does not retain useful redacted status fields'
-    grep_fixed 'waitForXhttpRoute(name, codespacePort(env))' "$WORKER_SCRIPT" \
+    grep_fixed 'waitForXhttpRoute(name, codespacePort(env), env)' "$WORKER_SCRIPT" \
         || fail 'Worker does not wait for the Codespaces XHTTP route after start'
+    grep_fixed 'waitForXhttpRoute(codespaceName, codespacePort(env), env)' "$WORKER_SCRIPT" \
+        || fail 'Worker health check does not use stable XHTTP route readiness'
+    grep_fixed 'route_ready: isRouteReadyProbe(routeProbe)' "$WORKER_SCRIPT" \
+        || fail 'Worker route_ready is not derived from stable route probe state'
     grep_fixed 'method: "OPTIONS"' "$WORKER_SCRIPT" \
         || fail 'Worker route readiness probe does not use the XHTTP OPTIONS probe'
     grep_fixed 'route_ready:' "$WORKER_SCRIPT" \
@@ -677,7 +681,7 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker UI/API does not warn clearly about rejected or expired GitHub tokens'
     grep_fixed 'GITHUB_STATE_WAIT_MS' "$WORKER_SCRIPT" \
         || fail 'Worker wake flow does not wait for GitHub Codespace state readiness'
-    grep_fixed 'waitForCodespaceAvailable(name, token)' "$WORKER_SCRIPT" \
+    grep_fixed 'waitForCodespaceAvailable(name, token, env)' "$WORKER_SCRIPT" \
         || fail 'Worker wake flow probes route before waiting for Codespace availability'
     grep_fixed 'isRouteStatusUsable(res.status)' "$WORKER_SCRIPT" \
         || fail 'Worker route readiness does not share the panel status classifier'
@@ -697,8 +701,12 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker status timeout/network errors are not returned as structured JSON'
     grep_fixed 'routeSettlingFailureText(data, route, routeReady)' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard can still report no failure while the route is settling'
-    grep_fixed 'data.start_accepted && data.route_ready === false && isRouteSettlingStatus(data.route_probe)' "$WORKER_SCRIPT" \
-        || fail 'Worker HTTP status does not distinguish accepted-but-route-settling responses'
+    grep_fixed 'data.start_accepted && data.reason === "codespace_state_not_ready"' "$WORKER_SCRIPT" \
+        || fail 'Worker HTTP status does not return accepted/in-progress for GitHub state waits'
+    grep_fixed 'data.route_probe?.error === "route_stability_not_confirmed"' "$WORKER_SCRIPT" \
+        || fail 'Worker HTTP status does not treat unconfirmed route stability as retryable'
+    grep_fixed 'data && (data.ok || data.start_accepted) && data.route_ready !== true' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not keep polling after an accepted start is still settling'
     grep_fixed 'Route history summary' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard does not summarize route health history'
     grep_fixed 'latencyTrend' "$WORKER_SCRIPT" \
@@ -829,6 +837,14 @@ test_route_candidate_monitor_is_bounded() {
         || fail 'route candidate diagnostics do not show average latency'
     grep_fixed 'refresh_route_candidate_health >/dev/null 2>&1 || true' "$SCRIPT" \
         || fail 'background supervisor does not refresh route candidate health'
+    awk '
+        /_background_tasks\(\)/ { in_fn=1; next }
+        in_fn && /refresh_route_candidate_health >\/dev\/null 2>&1 \|\| true/ { saw_startup_route=1 }
+        in_fn && /refresh_config_exports >\/dev\/null 2>&1 \|\| true/ && !saw_startup_route { exit 1 }
+        in_fn && /\(\( \+\+route_tick >= 5 \)\)/ { saw_loop_route=1 }
+        in_fn && /\(\( \+\+export_tick >= 5 \)\)/ && !saw_loop_route { exit 1 }
+        in_fn && /^}/ { exit 0 }
+    ' "$SCRIPT" || fail 'background supervisor can refresh exports before route probes, causing duplicate scans'
     grep_fixed 'route_candidate_health_summary | sed' "$SCRIPT" \
         || fail 'diagnostics do not display route candidate health'
     if grep_regex 'for[[:space:]]+.*in[[:space:]]+.*(/8|/16|/24|seq[[:space:]]+1[[:space:]]+254)' "$SCRIPT"; then
@@ -1073,6 +1089,12 @@ test_panel_guides_cloudflare_waker_setup() {
         || fail 'panel Worker test timeout is not configurable for long wake waits'
     grep_fixed 'curl -sS -m "$WAKER_TEST_TIMEOUT_SEC"' "$SCRIPT" \
         || fail 'panel Worker test still uses a fixed short curl timeout'
+    grep_fixed '.route_ready // empty' "$SCRIPT" \
+        || fail 'panel Worker test does not show route_ready from the Worker response'
+    grep_fixed '.route_probe.http_status // empty' "$SCRIPT" \
+        || fail 'panel Worker test does not show route probe HTTP status'
+    grep_fixed '.next_action // empty' "$SCRIPT" \
+        || fail 'panel Worker test does not show Worker next_action guidance'
     grep_fixed 'fingerprint_secret "$wake_secret"' "$SCRIPT" \
         || fail 'wizard does not store only a fingerprint of the wake secret'
     if grep_fixed 'GITHUB_TOKEN=' "$SCRIPT"; then
@@ -1209,7 +1231,7 @@ test_exports_filter_unusable_fallback_routes() {
 
 test_runtime_ready_rejects_started_but_unusable_route() {
     awk '
-        /ensure_runtime_ready\(\)/ { in_fn=1 }
+        /_ensure_runtime_ready_impl\(\)/ { in_fn=1 }
         in_fn && /started_route_unusable/ { saw_started_unusable=1 }
         saw_started_unusable && /started_route_ready/ { saw_ready=1 }
         saw_started_unusable && /started_route_still_unusable/ { saw_still_bad=1 }
@@ -1218,6 +1240,10 @@ test_runtime_ready_rejects_started_but_unusable_route() {
         END { exit (saw_started_unusable && saw_ready && saw_still_bad && saw_failure) ? 0 : 1 }
     ' "$SCRIPT" \
         || fail 'ensure_runtime_ready can still return success after a newly-started engine has an unusable XHTTP route'
+    grep_fixed 'ensure_runtime_ready() {' "$SCRIPT" \
+        || fail 'ensure_runtime_ready wrapper is missing'
+    grep_fixed 'with_runtime_lock _ensure_runtime_ready_impl "$@"' "$SCRIPT" \
+        || fail 'ensure_runtime_ready is not serialized by the runtime lock'
     pass 'runtime readiness rejects newly-started unusable XHTTP routes'
 }
 

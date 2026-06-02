@@ -16,6 +16,7 @@ UUID_FILE="$DATA_DIR/uuid.txt"
 BG_TASKS_PID="$DATA_DIR/bg_tasks.pid"
 BG_TASKS_VERSION_FILE="$DATA_DIR/bg_tasks.version"
 BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
+RUNTIME_LOCK_DIR="$DATA_DIR/runtime.lock"
 BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
 BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
 RESUME_GAP_FILE="$DATA_DIR/resume_gap.txt"
@@ -63,9 +64,11 @@ ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
 PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
 WAKER_TEST_TIMEOUT_SEC="${G2RAY_WAKER_TEST_TIMEOUT_SEC:-180}"
+RUNTIME_LOCK_WAIT_ATTEMPTS="${G2RAY_RUNTIME_LOCK_WAIT_ATTEMPTS:-900}"
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$WAKER_TEST_TIMEOUT_SEC" =~ ^[0-9]+$ && "$WAKER_TEST_TIMEOUT_SEC" -ge 30 ]] || WAKER_TEST_TIMEOUT_SEC=180
+[[ "$RUNTIME_LOCK_WAIT_ATTEMPTS" =~ ^[0-9]+$ && "$RUNTIME_LOCK_WAIT_ATTEMPTS" -ge 1 ]] || RUNTIME_LOCK_WAIT_ATTEMPTS=900
 [[ "$ROUTE_READY_STABLE_PROBES" =~ ^[0-9]+$ && "$ROUTE_READY_STABLE_PROBES" -ge 1 ]] || ROUTE_READY_STABLE_PROBES=2
 [[ "$ROUTE_READY_STABLE_SLEEP_SEC" =~ ^[0-9]+$ ]] || ROUTE_READY_STABLE_SLEEP_SEC=1
 
@@ -655,7 +658,7 @@ waker_metadata_summary() {
 }
 
 test_cloudflare_waker() {
-    local worker_url="${1:-}" wake_secret="${2:-}" response status ok reason codespace
+    local worker_url="${1:-}" wake_secret="${2:-}" response status ok reason codespace route_ready route_status route_latency next_action
     worker_url=$(normalize_waker_url "${worker_url:-$(waker_metadata_value worker_url)}" 2>/dev/null || true)
     if [[ -z "$worker_url" ]]; then
         echo -ne "  ${GREEN}Worker wake URL:${NC} "
@@ -688,9 +691,15 @@ test_cloudflare_waker() {
         status=$(printf '%s' "$response" | jq -r '.status // empty' 2>/dev/null)
         reason=$(printf '%s' "$response" | jq -r '.reason // empty' 2>/dev/null)
         codespace=$(printf '%s' "$response" | jq -r '.codespace // .body.name // empty' 2>/dev/null)
+        route_ready=$(printf '%s' "$response" | jq -r '.route_ready // empty' 2>/dev/null)
+        route_status=$(printf '%s' "$response" | jq -r '.route_probe.http_status // empty' 2>/dev/null)
+        route_latency=$(printf '%s' "$response" | jq -r '.route_probe.latency_ms // empty' 2>/dev/null)
+        next_action=$(printf '%s' "$response" | jq -r '.next_action // empty' 2>/dev/null)
         echo -e "  Result    : ${WHITE}ok=${ok} status=${status:-unknown}${NC}"
         [[ -n "$codespace" ]] && echo -e "  Codespace : ${WHITE}${codespace}${NC}"
+        [[ -n "$route_ready" ]] && echo -e "  Route     : ${WHITE}ready=${route_ready} http=${route_status:-unknown} latency=${route_latency:-unknown}ms${NC}"
         [[ -n "$reason" ]] && echo -e "  Reason    : ${YELLOW}${reason}${NC}"
+        [[ -n "$next_action" ]] && echo -e "  Next      : ${WHITE}${next_action}${NC}"
     else
         printf '%s\n' "$response" | sed 's/^/  /'
     fi
@@ -1263,7 +1272,79 @@ save_session_uptime() {
     printf '%s\n' "$now"               > "$SESSION_START_FILE"
 }
 
-stop_xray() {
+acquire_runtime_lock() {
+    local op="${1:-runtime}" i lock_pid attempts="$RUNTIME_LOCK_WAIT_ATTEMPTS"
+    [[ "$attempts" =~ ^[0-9]+$ && "$attempts" -ge 1 ]] || attempts=20
+    for ((i=1; i<=attempts; i++)); do
+        if mkdir "$RUNTIME_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true
+            printf '%s\n' "$op" > "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
+            return 0
+        fi
+        lock_pid=$(cat "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true)
+        if [[ "$lock_pid" == "$$" ]]; then
+            rm -f "$RUNTIME_LOCK_DIR/pid" "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
+            rmdir "$RUNTIME_LOCK_DIR" 2>/dev/null || true
+            if mkdir "$RUNTIME_LOCK_DIR" 2>/dev/null; then
+                printf '%s\n' "$$" > "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true
+                printf '%s\n' "$op" > "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
+                return 0
+            fi
+            continue
+        fi
+        if [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "$RUNTIME_LOCK_DIR/pid" "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
+            rmdir "$RUNTIME_LOCK_DIR" 2>/dev/null || true
+            if mkdir "$RUNTIME_LOCK_DIR" 2>/dev/null; then
+                printf '%s\n' "$$" > "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true
+                printf '%s\n' "$op" > "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
+                return 0
+            fi
+            continue
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+release_runtime_lock() {
+    local lock_pid
+    lock_pid=$(cat "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true)
+    [[ "$lock_pid" == "$$" ]] || return 0
+    rm -f "$RUNTIME_LOCK_DIR/pid" "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
+    rmdir "$RUNTIME_LOCK_DIR" 2>/dev/null || true
+}
+
+with_runtime_lock() {
+    local op="${1:-runtime}" rc shell_opts old_held
+    if [[ "${G2RAY_RUNTIME_LOCK_HELD:-}" == "1" ]]; then
+        "$@"
+        return $?
+    fi
+    if ! acquire_runtime_lock "$op"; then
+        log_event WARN "runtime_lock busy op=${op}"
+        return 1
+    fi
+    old_held="${G2RAY_RUNTIME_LOCK_HELD-__unset__}"
+    shell_opts="$-"
+    G2RAY_RUNTIME_LOCK_HELD=1
+    set +e
+    "$@"
+    rc=$?
+    case "$shell_opts" in
+        *e*) set -e ;;
+        *) set +e ;;
+    esac
+    if [[ "$old_held" == "__unset__" ]]; then
+        unset G2RAY_RUNTIME_LOCK_HELD
+    else
+        G2RAY_RUNTIME_LOCK_HELD="$old_held"
+    fi
+    release_runtime_lock
+    return "$rc"
+}
+
+_stop_xray_impl() {
     save_xray_stats 2>/dev/null || true
     local p owned_pids=()
     mapfile -t owned_pids < <(owned_xray_pids | awk 'NF && !seen[$0]++ {print}')
@@ -1292,6 +1373,10 @@ stop_xray() {
     fi
     rm -f "$XRAY_PID_FILE" 2>/dev/null || true
     sleep 0.5
+}
+
+stop_xray() {
+    with_runtime_lock _stop_xray_impl "$@"
 }
 
 upgrade_config_dns() {
@@ -1334,7 +1419,7 @@ upgrade_config_dns() {
     fi
 }
 
-start_xray() {
+_start_xray_impl() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_event WARN "start_xray missing_config path=${CONFIG_FILE}"
         echo -e "  ${RED}✖ No config found. Generate one first (Option 2).${NC}"
@@ -1359,6 +1444,10 @@ start_xray() {
     fi
     printf '%s\n' "$pid" > "$XRAY_PID_FILE"
     log_event INFO "xray launched pid=${pid} port=${XRAY_PORT}"
+}
+
+start_xray() {
+    with_runtime_lock _start_xray_impl "$@"
 }
 
 wait_for_port() {
@@ -1460,8 +1549,8 @@ _background_tasks() {
     write_background_supervisor_heartbeat
     if [[ -f "$CONFIG_FILE" ]]; then
         self_heal_once >/dev/null 2>&1 || true
-        refresh_config_exports >/dev/null 2>&1 || true
         refresh_route_candidate_health >/dev/null 2>&1 || true
+        refresh_config_exports >/dev/null 2>&1 || true
         health_probe >/dev/null 2>&1 || true
     fi
     while true; do
@@ -1485,8 +1574,8 @@ _background_tasks() {
         save_xray_stats    >/dev/null 2>&1 || true
         save_session_uptime >/dev/null 2>&1 || true
         (( ++health_tick >= 5 )) && { health_probe >/dev/null 2>&1; health_tick=0; }
-        (( ++export_tick >= 5 )) && { refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
         (( ++route_tick >= 5 )) && { refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
+        (( ++export_tick >= 5 )) && { refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
         (( ++tick >= 3 )) && { fetch_remote_message; tick=0; }
     done
 }
@@ -2265,8 +2354,12 @@ show_live_monitor() {
 }
 
 usable_fallback_ips() {
-    local ip ip_probe ip_ms count=0 max_links="$MAX_FALLBACK_LINKS" candidates usable
+    local ip ip_probe ip_ms count=0 max_links="$MAX_FALLBACK_LINKS" candidates usable probe_cap min_probe_cap probed=0
     [[ "$max_links" =~ ^[0-9]+$ && "$max_links" -gt 0 ]] || max_links=3
+    probe_cap=$(route_monitor_max_candidates)
+    min_probe_cap=$(( max_links * 3 ))
+    (( probe_cap < min_probe_cap )) && probe_cap=$min_probe_cap
+    (( probe_cap > 64 )) && probe_cap=64
     if ! route_health_cache_fresh; then
         refresh_route_candidate_health >/dev/null 2>&1 || true
     fi
@@ -2284,6 +2377,11 @@ usable_fallback_ips() {
     while IFS= read -r ip; do
         [[ -n "$ip" ]] || continue
         candidate_blacklisted "$ip" && continue
+        if (( probed >= probe_cap )); then
+            log_event WARN "fallback_route_filter probe_cap_reached probed=${probed} max=${probe_cap}"
+            break
+        fi
+        probed=$((probed + 1))
         read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
         update_route_candidate_stats "$ip" "$ip_probe" "$ip_ms" || true
         if xhttp_status_usable "$ip_probe"; then
@@ -2660,7 +2758,7 @@ show_diagnostics() {
     echo ""; echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
 }
 
-recover_now() {
+_recover_now_impl() {
     local no_prompt="${1:-}" failed=0 expose_failed=false route_ready=false engine_started=false xcode=0 xms=0
     log_event INFO "recover_now begin no_prompt=${no_prompt:-false}"
     echo -e "\n  ${GREEN}*${NC} ${WHITE}Running Soft Recover Sequence...${NC}\n"
@@ -2765,6 +2863,10 @@ recover_now() {
     return "$failed"
 }
 
+recover_now() {
+    with_runtime_lock _recover_now_impl "$@"
+}
+
 recover_now_json() {
     local recover_rc=0 rc=0 xcode=0 xms=0 route_ready=false engine=false listener=false status next_action ok_bool=false
     if recover_now --no-prompt >/dev/null 2>&1; then
@@ -2811,7 +2913,7 @@ JSON
     return "$rc"
 }
 
-force_reconnect() {
+_force_reconnect_impl() {
     local no_prompt="${1:-}" failed=0 expose_failed=false hard_failed=false
     log_event INFO "force_reconnect begin no_prompt=${no_prompt:-false}"
     echo -e "\n  ${GREEN}⠋${NC} ${WHITE}Running Clean Hard Restart & Reconnect Sequence...${NC}\n"
@@ -2897,7 +2999,11 @@ force_reconnect() {
     return 0
 }
 
-ensure_runtime_ready() {
+force_reconnect() {
+    with_runtime_lock _force_reconnect_impl "$@"
+}
+
+_ensure_runtime_ready_impl() {
     local reason="${1:-startup}" xcode xms
     record_resume_gap "$reason"
     [[ -f "$CONFIG_FILE" ]] || return 0
@@ -2952,6 +3058,10 @@ ensure_runtime_ready() {
 
     log_event ERROR "runtime_ready reason=${reason} start_failed port=${XRAY_PORT}"
     return 1
+}
+
+ensure_runtime_ready() {
+    with_runtime_lock _ensure_runtime_ready_impl "$@"
 }
 
 print_doctor_json() {

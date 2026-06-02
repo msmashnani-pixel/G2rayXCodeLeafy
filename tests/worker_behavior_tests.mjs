@@ -32,6 +32,7 @@ function baseEnv(overrides = {}) {
     WAKE_SECRET: "secret",
     GITHUB_TOKEN: "github-token",
     CODESPACE_NAME: "behavior-space",
+    ROUTE_READY_STABLE_SLEEP_MS: "0",
     ...overrides
   };
 }
@@ -506,6 +507,173 @@ async function testWakeRequiresStableRouteReadiness() {
   console.log("PASS: Worker rejects transient single route success");
 }
 
+async function testWakeWaitsBetweenStableRouteProbes() {
+  const routeCallTimes = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ state: "Available" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCallTimes.push(Date.now());
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/wake"),
+    baseEnv({ ROUTE_READY_STABLE_SLEEP_MS: "25" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.route_ready, true);
+  assert.equal(body.route_probe.stable_probes, 2);
+  assert.equal(routeCallTimes.length >= 2, true);
+  assert.equal(routeCallTimes[1] - routeCallTimes[0] >= 20, true);
+  console.log("PASS: Worker waits between stable route-readiness probes");
+}
+
+async function testWakeDoesNotClaimReadyFromSingleDeadlineProbe() {
+  let routeCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ state: "Available" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/wake"),
+    baseEnv({ ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 202);
+  assert.equal(body.route_ready, false);
+  assert.equal(body.route_probe.usable, true);
+  assert.equal(body.route_probe.http_status, 200);
+  assert.equal(body.route_probe.stable_probes, 1);
+  assert.equal(body.route_probe.error, "route_stability_not_confirmed");
+  assert.equal(routeCalls, 1);
+  console.log("PASS: Worker does not claim route ready from one deadline-limited probe");
+}
+
+async function testHealthRequiresStableRouteReadiness() {
+  let routeCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/health"),
+    baseEnv({ ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.route_ready, false);
+  assert.equal(body.route_probe.usable, true);
+  assert.equal(body.route_probe.stable_probes, 1);
+  assert.equal(body.route_probe.error, "route_stability_not_confirmed");
+  assert.equal(routeCalls, 1);
+  console.log("PASS: Worker health requires stable route readiness");
+}
+
+async function testWakePreservesStartAcceptedWhenGithubStateWaitTimesOut() {
+  let statusCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ state: "Starting" }), {
+        status: 202,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      statusCalls += 1;
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Starting",
+        pending_operation: true,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/wake"),
+    baseEnv({ GITHUB_STATE_WAIT_MS: "5", GITHUB_STATE_POLL_INTERVAL_MS: "1" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 202);
+  assert.equal(body.ok, false);
+  assert.equal(body.start_accepted, true);
+  assert.equal(body.reason, "codespace_state_not_ready");
+  assert.equal(body.github_wait_attempts >= 1, true);
+  assert.equal(statusCalls >= 1, true);
+  console.log("PASS: Worker preserves start_accepted when GitHub state wait times out");
+}
+
 async function testDashboardIncludesRouteHistorySummaryUi() {
   const response = await worker.fetch(new Request("https://worker.example/wake"), baseEnv(), {});
   const html = await response.text();
@@ -680,7 +848,7 @@ async function testHealthQueuesTokenFailureNotificationWithWaitUntil() {
   assert.deepEqual(body.notification_errors, []);
   assert.equal(waitUntilPromises.length, 1);
   await Promise.all(waitUntilPromises);
-  assert.equal(routeCalls, 1);
+  assert.equal(routeCalls, 0);
   assert.equal(notificationCalls, 1);
   console.log("PASS: Worker queues health token-failure notifications with waitUntil");
 }
@@ -753,6 +921,10 @@ try {
   await testWakeFailureIncludesNextAction();
   await testHealthTreatsHttp400RouteAsUsable();
   await testWakeRequiresStableRouteReadiness();
+  await testWakeWaitsBetweenStableRouteProbes();
+  await testWakeDoesNotClaimReadyFromSingleDeadlineProbe();
+  await testHealthRequiresStableRouteReadiness();
+  await testWakePreservesStartAcceptedWhenGithubStateWaitTimesOut();
   await testDashboardIncludesRouteHistorySummaryUi();
   await testHistoryRejectsBadSecretClearly();
   await testResponsesIncludeSecurityHeaders();

@@ -5,6 +5,7 @@ const GITHUB_STATE_POLL_INTERVAL_MS = 5000;
 const ROUTE_WAIT_MS = 35000;
 const ROUTE_POLL_INTERVAL_MS = 3000;
 const ROUTE_READY_STABLE_PROBES = 2;
+const ROUTE_READY_STABLE_SLEEP_MS = 1000;
 const FETCH_TIMEOUT_MS = 10000;
 const ROUTE_FETCH_TIMEOUT_MS = 7000;
 const HISTORY_KEY_PREFIX = "history:";
@@ -93,10 +94,21 @@ async function handleHealth(request, env, ctx) {
 
   const codespaceName = context.codespaceName;
   const status = await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN);
-  const routeProbe = await probeXhttpRoute(codespaceName, codespacePort(env));
+  const routeProbe = status.ok
+    ? await waitForXhttpRoute(codespaceName, codespacePort(env), env)
+    : {
+        url: routeUrl(codespaceName, codespacePort(env)),
+        usable: false,
+        http_status: 0,
+        latency_ms: null,
+        attempts: 0,
+        waited_ms: 0,
+        stable_probes: 0,
+        error: "github_status_not_ok"
+      };
   const data = withSurvivalFields({
     ...status,
-    route_ready: routeProbe.usable,
+    route_ready: isRouteReadyProbe(routeProbe),
     route_probe: routeProbe,
     next_action: nextActionForWake(status, routeProbe),
     message: healthMessage(status, routeProbe)
@@ -268,10 +280,18 @@ async function startCodespaceData(name, token, env) {
     };
   }
 
-  const readyState = await waitForCodespaceAvailable(name, token);
-  if (!readyState.ok) return readyState;
+  const readyState = await waitForCodespaceAvailable(name, token, env);
+  if (!readyState.ok) {
+    return {
+      ...readyState,
+      start_accepted: true,
+      github_wait_ms: readyState.waited_ms,
+      github_wait_attempts: readyState.attempts
+    };
+  }
 
-  const routeProbe = await waitForXhttpRoute(name, codespacePort(env));
+  const routeProbe = await waitForXhttpRoute(name, codespacePort(env), env);
+  const routeReady = isRouteReadyProbe(routeProbe);
 
   return {
     ok: true,
@@ -287,18 +307,20 @@ async function startCodespaceData(name, token, env) {
     retention_expires_at: readyState.retention_expires_at || (body && typeof body === "object" ? body.retention_expires_at || null : null),
     github_wait_ms: readyState.waited_ms,
     github_wait_attempts: readyState.attempts,
-    route_ready: routeProbe.usable,
+    route_ready: routeReady,
     route_probe: routeProbe,
     next_action: nextActionForWake(readyState, routeProbe),
-    message: routeProbe.usable
+    message: routeReady
       ? "Codespace start request accepted and the XHTTP route is usable."
       : "Codespace start request accepted, but the XHTTP route is still settling. Wait and try again; if it stays 404, open the panel and use option 6 Recover Now."
   };
 }
 
-async function waitForCodespaceAvailable(name, token) {
+async function waitForCodespaceAvailable(name, token, env) {
   const startedAt = Date.now();
-  const deadline = startedAt + GITHUB_STATE_WAIT_MS;
+  const stateWaitMs = configuredMs(env, "GITHUB_STATE_WAIT_MS", GITHUB_STATE_WAIT_MS, 1, 300000);
+  const pollIntervalMs = configuredMs(env, "GITHUB_STATE_POLL_INTERVAL_MS", GITHUB_STATE_POLL_INTERVAL_MS, 1, 60000);
+  const deadline = startedAt + stateWaitMs;
   let attempts = 0;
   let last = {
     ok: false,
@@ -312,20 +334,20 @@ async function waitForCodespaceAvailable(name, token) {
     message: "Codespace state has not been checked yet."
   };
 
-  while (Date.now() <= deadline) {
+  while (Date.now() < deadline) {
     attempts += 1;
     last = await getCodespaceStatus(name, token);
     last.attempts = attempts;
     last.waited_ms = Date.now() - startedAt;
     if (!last.ok && isTransientGithubStatusFailure(last)) {
-      if (Date.now() + GITHUB_STATE_POLL_INTERVAL_MS > deadline) break;
-      await sleep(GITHUB_STATE_POLL_INTERVAL_MS);
+      if (Date.now() + pollIntervalMs > deadline) break;
+      await sleep(pollIntervalMs);
       continue;
     }
     if (!last.ok) return last;
     if (isCodespaceAvailable(last)) return last;
-    if (Date.now() + GITHUB_STATE_POLL_INTERVAL_MS > deadline) break;
-    await sleep(GITHUB_STATE_POLL_INTERVAL_MS);
+    if (Date.now() + pollIntervalMs > deadline) break;
+    await sleep(pollIntervalMs);
   }
 
   return {
@@ -490,7 +512,13 @@ function githubHeaders(token) {
 }
 
 function responseStatusFor(data) {
-  if (data.ok && data.start_accepted && data.route_ready === false && isRouteSettlingStatus(data.route_probe)) return 202;
+  if (data.start_accepted && data.reason === "codespace_state_not_ready") return 202;
+  if (
+    data.ok &&
+    data.start_accepted &&
+    data.route_ready === false &&
+    (isRouteSettlingStatus(data.route_probe) || data.route_probe?.error === "route_stability_not_confirmed")
+  ) return 202;
   if (data.ok) return 200;
   if ([401, 402, 403, 404, 429].includes(data.status)) return data.status;
   return 502;
@@ -582,6 +610,15 @@ function isRouteSettlingStatus(routeProbe) {
   return status === 0 || status === 404;
 }
 
+function isRouteReadyProbe(routeProbe) {
+  return Boolean(
+    routeProbe &&
+    routeProbe.usable === true &&
+    Number(routeProbe.stable_probes || 0) >= ROUTE_READY_STABLE_PROBES &&
+    !routeProbe.error
+  );
+}
+
 function isCodespaceAvailable(status) {
   const state = String(status && status.state || "").toLowerCase();
   return Boolean(status && status.ok && (state === "available" || state === "running") && status.pending_operation !== true);
@@ -596,6 +633,9 @@ function nextActionForWake(status, routeProbe) {
   }
   if (!status.ok) return "Open GitHub Codespaces or rotate the GitHub token, then try the Worker again.";
   if (!isCodespaceAvailable(status)) return "Wait for GitHub to finish starting the Codespace, then press Check Health.";
+  if (routeProbe.error === "route_stability_not_confirmed") {
+    return "The route answered once, but stability was not confirmed yet. Wait a few seconds, then press Check Health or Start Codespace again.";
+  }
   if (routeProbe.usable) return "Try the same VLESS config again.";
   if (routeProbe.http_status === 404) return "Open the panel, check option 14 Diagnostics, then use option 6 Recover Now if the route stays 404.";
   if (routeProbe.http_status === 0) return "The app.github.dev route did not resolve or answer. Open the Codespace once, then check port 443 visibility and panel diagnostics.";
@@ -951,9 +991,20 @@ function codespacePort(env) {
   return Number.isInteger(value) && value > 0 && value <= 65535 ? value : DEFAULT_CODESPACE_PORT;
 }
 
-async function waitForXhttpRoute(name, port) {
+function configuredMs(env, name, fallback, min, max) {
+  const value = Number.parseInt(String(env && env[name] != null ? env[name] : fallback), 10);
+  if (!Number.isInteger(value)) return fallback;
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
+}
+
+async function waitForXhttpRoute(name, port, env) {
   const startedAt = Date.now();
-  const deadline = startedAt + ROUTE_WAIT_MS;
+  const routeWaitMs = configuredMs(env, "ROUTE_WAIT_MS", ROUTE_WAIT_MS, 1, 300000);
+  const pollIntervalMs = configuredMs(env, "ROUTE_POLL_INTERVAL_MS", ROUTE_POLL_INTERVAL_MS, 1, 60000);
+  const stableSleepMs = configuredMs(env, "ROUTE_READY_STABLE_SLEEP_MS", ROUTE_READY_STABLE_SLEEP_MS, 0, 10000);
+  const deadline = startedAt + routeWaitMs;
   let attempts = 0;
   let stableProbes = 0;
   let last = {
@@ -967,22 +1018,33 @@ async function waitForXhttpRoute(name, port) {
     error: "not_checked"
   };
 
-  while (Date.now() <= deadline) {
+  while (Date.now() < deadline) {
     attempts += 1;
     last = await probeXhttpRoute(name, port, attempts, startedAt);
     if (last.usable) {
       stableProbes += 1;
       last.stable_probes = stableProbes;
       if (stableProbes >= ROUTE_READY_STABLE_PROBES) return last;
+      if (stableSleepMs > 0) {
+        const delay = Math.min(stableSleepMs, Math.max(0, deadline - Date.now()));
+        if (delay > 0) await sleep(delay);
+      }
       continue;
     }
     stableProbes = 0;
     last.stable_probes = stableProbes;
 
-    if (Date.now() + ROUTE_POLL_INTERVAL_MS > deadline) break;
-    await sleep(ROUTE_POLL_INTERVAL_MS);
+    if (Date.now() + pollIntervalMs > deadline) break;
+    await sleep(pollIntervalMs);
   }
 
+  if (last.usable && stableProbes < ROUTE_READY_STABLE_PROBES) {
+    return {
+      ...last,
+      stable_probes: stableProbes,
+      error: "route_stability_not_confirmed"
+    };
+  }
   return last;
 }
 
@@ -1348,7 +1410,7 @@ async function startWake() {
   try {
     setProgress(steps, 1);
     const data = await callApi("/api/wake");
-    setProgress(steps, data.ok ? 4 : 1);
+    setProgress(steps, data.route_ready ? 4 : data.start_accepted ? 3 : data.ok ? 4 : 1);
     renderResult(data);
     if (shouldPollRoute(data)) {
       scheduleHealthPoll();
@@ -1399,7 +1461,7 @@ async function copyStatus() {
 }
 
 function shouldPollRoute(data) {
-  return Boolean(data && data.ok && data.route_ready !== true && data.route_probe);
+  return Boolean(data && (data.ok || data.start_accepted) && data.route_ready !== true && data.quota_blocked !== true);
 }
 
 function scheduleHealthPoll() {
