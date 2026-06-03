@@ -14,7 +14,20 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Syntax check panel
-        run: bash -n ./g2ray.sh
+        run: |
+          bash -n ./g2ray.sh
+          bash -n ./scripts/post-start.sh
+          bash -n ./tests/g2ray_static_tests.sh
+          bash -n ./tests/g2ray_behavior_tests.sh
+
+      - name: ShellCheck critical issues
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -S error ./g2ray.sh ./scripts/post-start.sh ./tests/*.sh
+
+      - name: Syntax check Worker
+        run: node --check ./worker/codespace-waker/src/index.js
 
       - name: Run static regression tests
         run: bash ./tests/g2ray_static_tests.sh
@@ -24,3 +37,6 @@ jobs:
 
       - name: Run Worker behavior tests
         run: node ./tests/worker_behavior_tests.mjs
+
+      - name: Wrangler dry-run bundle check
+        run: npx --yes wrangler@4 deploy worker/codespace-waker/src/index.js --name g2ray-codespace-waker-ci --compatibility-date 2024-11-01 --dry-run --outdir /tmp/g2ray-worker-dry-run

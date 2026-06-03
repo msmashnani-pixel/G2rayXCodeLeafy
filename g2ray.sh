@@ -4,7 +4,26 @@ set -euo pipefail
 
 readonly G2RAY_ID="G2ray Panel v1.4.3"
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_REPO="${G2RAY_PROJECT_REPO:-shayanay80atomic/G2rayXCodeLeafy}"
+
+detect_project_repo_default() {
+    local remote url slug upstream_ref upstream_remote
+    upstream_ref=$(git -C "$BASE_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+    upstream_remote="${upstream_ref%%/*}"
+    for remote in "$upstream_remote" origin shaun upstream; do
+        [[ -n "$remote" && "$remote" != "$upstream_ref" ]] || continue
+        url=$(git -C "$BASE_DIR" remote get-url "$remote" 2>/dev/null || true)
+        [[ -n "$url" ]] || continue
+        slug=$(printf '%s' "$url" \
+            | sed -E 's#^git@github.com:##; s#^https://github.com/##; s#\.git$##')
+        if [[ "$slug" =~ ^[^/]+/[^/]+$ ]]; then
+            printf '%s\n' "$slug"
+            return 0
+        fi
+    done
+    printf 'shaunme32/G2rayXCodeLeafy\n'
+}
+
+PROJECT_REPO="${G2RAY_PROJECT_REPO:-$(detect_project_repo_default)}"
 RAW_BASE_URL="${G2RAY_RAW_BASE_URL:-https://raw.githubusercontent.com/${PROJECT_REPO}/main}"
 
 GREEN='\033[1;32m'; WHITE='\033[1;37m'; RED='\033[1;31m'
@@ -32,6 +51,8 @@ ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
 BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
 LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
 LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
+LATENCY_FOCUS_FILE="$DATA_DIR/latency_focus_mode"
+LATENCY_FOCUS_DISABLED_FILE="$DATA_DIR/latency_focus_mode_disabled"
 LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
 PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
 MANUAL_ROUTE_CANDIDATES_FILE="$DATA_DIR/manual_route_candidates.txt"
@@ -136,6 +157,41 @@ low_overhead_summary() {
     fi
 }
 
+latency_focus_enabled() {
+    [[ -s "$LATENCY_FOCUS_DISABLED_FILE" ]] && return 1
+    [[ -s "$LATENCY_FOCUS_FILE" ]] && return 0
+    [[ "${G2RAY_LATENCY_FOCUS:-0}" == "1" ]]
+}
+
+enable_latency_focus_mode() {
+    rm -f "$LATENCY_FOCUS_DISABLED_FILE" 2>/dev/null || true
+    printf 'enabled\n' > "$LATENCY_FOCUS_FILE"
+    chmod 600 "$LATENCY_FOCUS_FILE" 2>/dev/null || true
+}
+
+disable_latency_focus_mode() {
+    rm -f "$LATENCY_FOCUS_FILE" 2>/dev/null || true
+    printf 'disabled\n' > "$LATENCY_FOCUS_DISABLED_FILE"
+    chmod 600 "$LATENCY_FOCUS_DISABLED_FILE" 2>/dev/null || true
+}
+
+toggle_latency_focus_mode() {
+    if latency_focus_enabled; then
+        disable_latency_focus_mode
+        return 1
+    fi
+    enable_latency_focus_mode
+    return 0
+}
+
+latency_focus_summary() {
+    if latency_focus_enabled; then
+        printf 'Enabled - keeps heartbeat/self-heal, suppresses noncritical logs, and minimizes background refreshes\n'
+    else
+        printf 'Disabled - normal diagnostics, route refresh, and exports are enabled\n'
+    fi
+}
+
 log_structured_event() {
     local ts="$1" level="$2" msg="$3" event
     event=$(printf '%s' "$msg" | awk '{print $1; exit}' | tr -cd 'A-Za-z0-9_.:-')
@@ -146,14 +202,26 @@ log_structured_event() {
         >> "$STRUCTURED_LOG_FILE" 2>/dev/null || true
 }
 
+quiet_info_event_important() {
+    case "${1:-}" in
+        runtime_ready*|boot_status*|background\ supervisor_started*|self_heal\ restart_ok*|recover_now*|support_bundle*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 log_event() {
     local level="$1"; shift || true
     local ts msg
-    if low_overhead_enabled && [[ "$level" == "INFO" ]]; then
+    if latency_focus_enabled && [[ "$level" != "ERROR" ]]; then
+        return 0
+    fi
+    msg="$*"
+    if low_overhead_enabled && [[ "$level" == "INFO" ]] && ! quiet_info_event_important "$msg"; then
         return 0
     fi
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
-    msg="$*"
     rotate_log_file "$LOG_FILE"
     printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
     log_structured_event "$ts" "$level" "$msg"
@@ -1052,8 +1120,35 @@ refresh_screen() {
     draw_logo
 }
 
+verify_update_candidate() {
+    local candidate="${1:-}"
+    [[ -s "$candidate" ]] || return 1
+    grep -Fq 'readonly G2RAY_ID="G2ray Panel' "$candidate" 2>/dev/null || return 1
+    grep -Fq 'Educational use only' "$candidate" 2>/dev/null || return 1
+    grep -Fq 'detect_project_repo_default()' "$candidate" 2>/dev/null || return 1
+    grep -Fq 'ensure_runtime_ready()' "$candidate" 2>/dev/null || return 1
+    grep -Fq 'print_doctor_json()' "$candidate" 2>/dev/null || return 1
+    grep -Fq 'recover_now_json()' "$candidate" 2>/dev/null || return 1
+    bash -n "$candidate" 2>/dev/null || return 1
+    return 0
+}
+
+tracked_panel_has_local_changes() {
+    command -v git >/dev/null 2>&1 || return 1
+    git -C "$BASE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+    git -C "$BASE_DIR" diff --quiet -- g2ray.sh 2>/dev/null || return 0
+    git -C "$BASE_DIR" diff --cached --quiet -- g2ray.sh 2>/dev/null || return 0
+    return 1
+}
+
 check_for_updates() {
     [[ "${G2RAY_AUTO_UPDATE:-0}" == "1" ]] || return 0
+    latency_focus_enabled && return 0
+    if [[ "${G2RAY_AUTO_UPDATE_FORCE:-0}" != "1" ]] && tracked_panel_has_local_changes; then
+        printf "  %b⚠%b %bAuto-update skipped because g2ray.sh has local changes. Set G2RAY_AUTO_UPDATE_FORCE=1 to override.%b\n" "$YELLOW" "$NC" "$DIM" "$NC"
+        sleep 1
+        return 0
+    fi
     clear; draw_logo
     local tmp="" staged=""
     tmp=$(mktemp "${TMPDIR:-/tmp}/g2ray_remote.XXXXXX") || {
@@ -1068,7 +1163,7 @@ check_for_updates() {
         i=$(( (i+1) % 10 )); sleep 0.1
     done
     wait "$pid" || true
-    if [[ -f "$tmp" ]] && grep -q "G2ray Panel" "$tmp" 2>/dev/null && bash -n "$tmp" 2>/dev/null; then
+    if verify_update_candidate "$tmp"; then
         if ! cmp -s "$0" "$tmp"; then
             printf "\r  %b✔%b %bUpdate found! Installing...              %b\n" "$GREEN" "$NC" "$WHITE" "$NC"
             staged=$(mktemp "${TMPDIR:-/tmp}/g2ray_update.XXXXXX") || {
@@ -1665,9 +1760,11 @@ _background_tasks() {
     write_background_supervisor_heartbeat
     if [[ -f "$CONFIG_FILE" ]]; then
         self_heal_once >/dev/null 2>&1 || true
-        refresh_route_candidate_health >/dev/null 2>&1 || true
-        refresh_config_exports >/dev/null 2>&1 || true
-        health_probe >/dev/null 2>&1 || true
+        if ! latency_focus_enabled; then
+            refresh_route_candidate_health >/dev/null 2>&1 || true
+            refresh_config_exports >/dev/null 2>&1 || true
+            health_probe >/dev/null 2>&1 || true
+        fi
     fi
     while true; do
         sleep 60
@@ -1689,6 +1786,10 @@ _background_tasks() {
         self_heal_once >/dev/null 2>&1 || true
         save_xray_stats    >/dev/null 2>&1 || true
         save_session_uptime >/dev/null 2>&1 || true
+        if latency_focus_enabled; then
+            (( ++health_tick >= 15 )) && { health_probe >/dev/null 2>&1; health_tick=0; }
+            continue
+        fi
         (( ++health_tick >= 5 )) && { health_probe >/dev/null 2>&1; health_tick=0; }
         if low_overhead_enabled; then
             (( ++route_tick >= 15 )) && { refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
@@ -2681,7 +2782,7 @@ safe_max_fallback_links() {
 }
 
 usable_fallback_ips() {
-    local ip ip_probe ip_ms reason count=0 max_links candidates usable probe_cap min_probe_cap probed=0
+    local ip ip_probe ip_ms reason count=0 max_links candidates usable probe_cap min_probe_cap probed=0 emitted=""
     max_links=$(safe_max_fallback_links)
     probe_cap=$(route_monitor_max_candidates)
     min_probe_cap=$(( max_links * 3 ))
@@ -2694,15 +2795,17 @@ usable_fallback_ips() {
         while IFS= read -r ip; do
             [[ -n "$ip" ]] || continue
             printf '%s\n' "$ip"
+            emitted="${emitted} ${ip}"
+            usable=true
             count=$((count + 1))
             (( count >= max_links )) && return 0
         done < <(cached_usable_fallback_ips)
-        (( count > 0 )) && return 0
     fi
 
     candidates=$(resolve_domain_ips "$PORT_DOMAIN" || true)
     while IFS= read -r ip; do
         [[ -n "$ip" ]] || continue
+        [[ " $emitted " == *" $ip "* ]] && continue
         candidate_blacklisted "$ip" && continue
         route_candidate_cooldown_active "$ip" && ! route_candidate_cooldown_bypass "$ip" && continue
         if (( probed >= probe_cap )); then
@@ -2715,6 +2818,7 @@ usable_fallback_ips() {
         update_route_candidate_stats "$ip" "$ip_probe" "$ip_ms" "live_fallback_probe" "$reason" || true
         if xhttp_status_usable "$ip_probe"; then
             printf '%s\n' "$ip"
+            emitted="${emitted} ${ip}"
             save_last_good_route "$ip" "$ip_probe" "$ip_ms" "live_fallback_probe"
             usable=true
             count=$((count + 1))
@@ -2760,12 +2864,16 @@ generate_ordered_links() {
 }
 
 git_remote_repo_slug() {
-    local url slug
-    url=$(git -C "$BASE_DIR" config --get remote.shaun.url 2>/dev/null || true)
-    [[ -n "$url" ]] || url=$(git -C "$BASE_DIR" config --get remote.origin.url 2>/dev/null || true)
-    [[ -n "$url" ]] || url=$(git -C "$BASE_DIR" config --get remote.upstream.url 2>/dev/null || true)
-    slug=$(printf '%s' "$url" | sed -nE 's#^https://github\.com/([^/]+/[^/.]+)(\.git)?$#\1#p; s#^git@github\.com:([^/]+/[^/.]+)(\.git)?$#\1#p')
-    [[ -n "$slug" ]] && printf '%s\n' "$slug"
+    local remote url slug upstream_ref upstream_remote
+    upstream_ref=$(git -C "$BASE_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+    upstream_remote="${upstream_ref%%/*}"
+    for remote in "$upstream_remote" origin shaun upstream; do
+        [[ -n "$remote" && "$remote" != "$upstream_ref" ]] || continue
+        url=$(git -C "$BASE_DIR" config --get "remote.${remote}.url" 2>/dev/null || true)
+        [[ -n "$url" ]] || continue
+        slug=$(printf '%s' "$url" | sed -nE 's#^https://github\.com/([^/]+/[^/.]+)(\.git)?$#\1#p; s#^git@github\.com:([^/]+/[^/.]+)(\.git)?$#\1#p')
+        [[ -n "$slug" ]] && { printf '%s\n' "$slug"; return 0; }
+    done
 }
 
 subscription_url() {
@@ -2774,6 +2882,13 @@ subscription_url() {
     [[ -n "$slug" ]] || slug="$PROJECT_REPO"
     branch="${G2RAY_SUBSCRIPTION_BRANCH:-main}"
     printf 'https://raw.githubusercontent.com/%s/%s/configs-subscription-base64.txt' "$slug" "$branch"
+}
+
+subscription_url_warning() {
+    cat >&2 <<'EOF'
+Warning: this URL is usable by VLESS clients only if the file is publicly reachable or served through a client-compatible private endpoint.
+Base64 is not encryption; publishing configs-subscription-base64.txt exposes live configs to anyone who can read the URL.
+EOF
 }
 
 write_config_metadata() {
@@ -2794,7 +2909,8 @@ write_config_metadata() {
   "subscription_file": "$(json_escape "$SUBSCRIPTION_FILE")",
   "subscription_url": "$(json_escape "$sub_url")",
   "performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
-  "low_overhead": $(low_overhead_enabled && printf true || printf false)
+  "low_overhead": $(low_overhead_enabled && printf true || printf false),
+  "latency_focus": $(latency_focus_enabled && printf true || printf false)
 }
 JSON
     chmod 600 "$CONFIG_META_FILE" 2>/dev/null || true
@@ -2821,6 +2937,42 @@ refresh_config_exports() {
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
     ((${#link_array[@]})) || return 1
     write_config_exports_from_links "${link_array[@]}"
+}
+
+publish_subscription_export() {
+    local consent="${1:-}" push_mode="${2:-}" subscription_rel
+    refresh_config_exports || {
+        echo "Could not refresh subscription export. Generate a config first." >&2
+        return 1
+    }
+    [[ -s "$SUBSCRIPTION_FILE" ]] || {
+        echo "Subscription export is empty. Generate a config first." >&2
+        return 1
+    }
+    if [[ "${G2RAY_PUBLISH_PUBLIC_SUBSCRIPTION:-0}" != "1" && "$consent" != "--yes" ]]; then
+        cat >&2 <<'EOF'
+Publishing configs-subscription-base64.txt exposes live VLESS credentials to anyone who can read the URL.
+Run with G2RAY_PUBLISH_PUBLIC_SUBSCRIPTION=1 or --yes only when you intentionally want a public/client-refreshable subscription.
+EOF
+        return 2
+    fi
+    command -v git >/dev/null 2>&1 || { echo "git is required to publish the subscription export." >&2; return 1; }
+    git -C "$BASE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+        echo "This directory is not a git repository." >&2
+        return 1
+    }
+    subscription_rel="${SUBSCRIPTION_FILE#$BASE_DIR/}"
+    [[ "$subscription_rel" != "$SUBSCRIPTION_FILE" ]] || subscription_rel="$(basename "$SUBSCRIPTION_FILE")"
+    git -C "$BASE_DIR" add -f -- "$subscription_rel"
+    if git -C "$BASE_DIR" diff --cached --quiet -- "$subscription_rel"; then
+        echo "Subscription export already matches git index."
+    else
+        git -C "$BASE_DIR" commit -m "Update subscription export"
+    fi
+    if [[ "$push_mode" == "--push" || "${G2RAY_PUBLISH_SUBSCRIPTION_PUSH:-0}" == "1" ]]; then
+        git -C "$BASE_DIR" push
+    fi
+    printf 'Subscription URL: %s\n' "$(subscription_url)"
 }
 
 generate_link() {
@@ -3121,7 +3273,8 @@ show_diagnostics() {
     echo -e "\n  ${WHITE}${B}Runtime Tuning${NC}"
     echo -e "  Performance profile : ${WHITE}${PERFORMANCE_PROFILE}${NC}"
     echo -e "  Low-overhead mode   : ${WHITE}$(low_overhead_summary)${NC}"
-    echo -e "  Private subscription URL : ${WHITE}$(subscription_url)${NC}"
+    echo -e "  Latency focus mode  : ${WHITE}$(latency_focus_summary)${NC}"
+    echo -e "  Raw subscription URL : ${WHITE}$(subscription_url)${NC}"
     echo -e "  ${DIM}Only publish generated exports through a private repo/channel; public repos expose live credentials.${NC}"
 
     echo -e "\n  ${WHITE}${B}Recent G2ray Events${NC}"
@@ -3472,6 +3625,9 @@ print_doctor_json() {
   "supervisor": "$(json_escape "$supervisor")",
   "last_good_route": "$(json_escape "$last_good")",
   "waker_configured": $([[ -n "$waker_url" ]] && printf true || printf false),
+  "low_overhead": $(low_overhead_enabled && printf true || printf false),
+  "latency_focus": $(latency_focus_enabled && printf true || printf false),
+  "performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
   "log_file": "$(json_escape "$LOG_FILE")",
   "structured_log_file": "$(json_escape "$STRUCTURED_LOG_FILE")",
   "diagnostic_log_file": "$(json_escape "$DIAGNOSTIC_LOG_FILE")"
@@ -3488,10 +3644,27 @@ if [[ "${1:-}" == "--doctor-json" || "${1:-}" == "--status-json" || ( "${1:-}" =
     exit 0
 fi
 
+if [[ "${1:-}" == "--status" || "${1:-}" == "status" ]]; then
+    print_doctor_json
+    exit 0
+fi
+
 if [[ "${1:-}" == "--print-subscription-url" || "${1:-}" == "subscription-url" ]]; then
+    subscription_url_warning
     subscription_url
     printf '\n'
     exit 0
+fi
+
+if [[ "${1:-}" == "--refresh-exports" || "${1:-}" == "--export" || "${1:-}" == "export" ]]; then
+    refresh_config_exports
+    printf 'Exports refreshed: %s\n' "$SUBSCRIPTION_FILE"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--publish-subscription" || "${1:-}" == "publish-subscription" ]]; then
+    publish_subscription_export "${2:-}" "${3:-}"
+    exit $?
 fi
 
 if [[ "${1:-}" == "--support-bundle" || "${1:-}" == "support-bundle" ]]; then
@@ -3507,6 +3680,23 @@ fi
 if [[ "${1:-}" == "--recover-now" || "${1:-}" == "recover" ]]; then
     recover_now --no-prompt
     exit $?
+fi
+
+if [[ "${1:-}" == "--start" || "${1:-}" == "start" ]]; then
+    [[ -f "$CONFIG_FILE" ]] || { echo "No config exists yet. Run the panel and generate one first." >&2; exit 1; }
+    ensure_runtime_ready "headless_start"
+    start_background_tasks
+    exit $?
+fi
+
+if [[ "${1:-}" == "--latency-focus" || "${1:-}" == "latency-focus" ]]; then
+    case "${2:-toggle}" in
+        on|enable|enabled) enable_latency_focus_mode; printf 'latency_focus=enabled\n' ;;
+        off|disable|disabled) disable_latency_focus_mode; printf 'latency_focus=disabled\n' ;;
+        status) latency_focus_enabled && printf 'latency_focus=enabled\n' || printf 'latency_focus=disabled\n' ;;
+        *) toggle_latency_focus_mode && printf 'latency_focus=enabled\n' || printf 'latency_focus=disabled\n' ;;
+    esac
+    exit 0
 fi
 
 if [[ "${1:-}" == "--background-supervisor" ]]; then
@@ -3593,6 +3783,11 @@ while true; do
     else
         _LOW_LABEL="${DIM}currently Disabled${NC}"
     fi
+    if latency_focus_enabled; then
+        _LATENCY_LABEL="${GREEN}currently Enabled${NC}"
+    else
+        _LATENCY_LABEL="${DIM}currently Disabled${NC}"
+    fi
 
     echo -e "  ${WHITE}${B}Engine Status  :${NC} $(echo -e "$_STATUS")"
     echo -e "  ${WHITE}${B}Anti-Sleep Mode:${NC} $(echo -e "$_KA")\n"
@@ -3606,6 +3801,7 @@ while true; do
     echo -e "   ${RED}7)${NC} Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))"
     echo -e "   ${RED}8)${NC} Donate Config"
     echo -e "  ${RED}18)${NC} Toggle Low-Overhead Mode ($(echo -e "$_LOW_LABEL"))"
+    echo -e "  ${RED}49)${NC} Toggle Latency Focus Mode ($(echo -e "$_LATENCY_LABEL"))"
     echo ""
     echo -e "  ${WHITE}${B}● ANALYTICS & TOOLS${NC}"
     echo -e "   ${RED}9)${NC} Data Usage                 ${RED}12)${NC} Server Location"
@@ -3679,7 +3875,7 @@ while true; do
             echo -e "  ${RED}● Configs & QR Codes${NC}"
             echo -e "  ${DIM}Raw links are printed without color codes and saved to:${NC}"
             echo -e "  ${DIM}Base64 subscription export:${NC} ${WHITE}${SUBSCRIPTION_FILE}${NC}"
-            echo -e "  ${DIM}Private subscription URL:${NC} ${WHITE}$(subscription_url)${NC}"
+            echo -e "  ${DIM}Raw subscription URL:${NC} ${WHITE}$(subscription_url)${NC}"
             echo -e "  ${DIM}Generated exports are ignored by git because public repos expose live credentials.${NC}"
             echo -e "  ${WHITE}${MOBILE_CONFIG_FILE}${NC}\n"
             _INDEX=1
@@ -3814,6 +4010,17 @@ while true; do
                 echo -e "  ${DIM}Full background monitoring is restored.${NC}"
             fi
             sleep 2
+            ;;
+        49)
+            if toggle_latency_focus_mode; then
+                echo -e "\n  ${GREEN}Latency focus mode enabled.${NC}"
+                echo -e "  ${DIM}Heartbeat and self-heal stay on; noncritical logs, route scans, exports, and remote messages are minimized.${NC}"
+                echo -e "  ${DIM}Use this only while actively testing latency. Disable it before collecting support logs.${NC}"
+            else
+                echo -e "\n  ${WHITE}Latency focus mode disabled.${NC}"
+                echo -e "  ${DIM}Normal diagnostics, route scans, exports, and logs are restored.${NC}"
+            fi
+            sleep 3
             ;;
         0) echo -e "\n  ${GREEN}Exiting G2ray Panel...${NC}"; exit 0 ;;
         *) echo -e "  ${RED}✖ Invalid option.${NC}"; sleep 1 ;;

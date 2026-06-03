@@ -126,8 +126,18 @@ test_port_visibility_failures_are_handled() {
 test_self_update_is_opt_in() {
     grep_fixed 'G2RAY_AUTO_UPDATE' "$SCRIPT" \
         || fail 'self-update is not controlled by an opt-in environment variable'
-    grep_fixed 'bash -n "$tmp"' "$SCRIPT" \
-        || fail 'self-update does not syntax-check the downloaded script before replacing itself'
+    grep_fixed 'verify_update_candidate()' "$SCRIPT" \
+        || fail 'self-update does not use a centralized candidate verifier'
+    grep_fixed 'verify_update_candidate "$tmp"' "$SCRIPT" \
+        || fail 'self-update does not verify the downloaded script before replacing itself'
+    grep_fixed 'bash -n "$candidate"' "$SCRIPT" \
+        || fail 'self-update verifier does not syntax-check the downloaded script before replacing itself'
+    grep_fixed 'grep -Fq '\''detect_project_repo_default()'\''' "$SCRIPT" \
+        || fail 'self-update verifier does not check for expected source markers'
+    grep_fixed 'tracked_panel_has_local_changes()' "$SCRIPT" \
+        || fail 'self-update does not define a tracked-script dirty-worktree guard'
+    grep_fixed 'G2RAY_AUTO_UPDATE_FORCE' "$SCRIPT" \
+        || fail 'self-update dirty-worktree guard cannot be explicitly overridden'
     if grep_fixed 'cat "$tmp" > "$0"' "$SCRIPT"; then
         fail 'self-update still writes directly over the running script'
     fi
@@ -627,7 +637,7 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker does not wait for the Codespaces XHTTP route after start'
     grep_fixed 'waitForXhttpRoute(codespaceName, codespacePort(env), env)' "$WORKER_SCRIPT" \
         || fail 'Worker health check does not use stable XHTTP route readiness'
-    grep_fixed 'route_ready: checkRoute ? isRouteReadyProbe(routeProbe) : null' "$WORKER_SCRIPT" \
+    grep_fixed 'route_ready: routeChecked ? isRouteReadyProbe(routeProbe) : null' "$WORKER_SCRIPT" \
         || fail 'Worker route_ready is not derived from stable route probe state'
     grep_fixed 'url.searchParams.get("route") !== "false"' "$WORKER_SCRIPT" \
         || fail 'Worker health API does not support a cheap route-skip status check'
@@ -666,7 +676,7 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker does not expose a dashboard health API'
     grep_fixed '/api/history' "$WORKER_SCRIPT" \
         || fail 'Worker does not expose a dashboard history API'
-    grep_fixed 'getCodespaceStatus(codespaceName, env.GITHUB_TOKEN)' "$WORKER_SCRIPT" \
+    grep_fixed 'getCodespaceStatus(codespaceName, env.GITHUB_TOKEN, env)' "$WORKER_SCRIPT" \
         || fail 'Worker health API does not query the GitHub Codespace state'
     grep_fixed 'recordHistory(env, {' "$WORKER_SCRIPT" \
         || fail 'Worker does not persist wake/health events when KV is configured'
@@ -694,6 +704,12 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker route readiness does not treat HTTP 400 as usable like the panel'
     grep_fixed 'next_action' "$WORKER_SCRIPT" \
         || fail 'Worker API does not return a concrete next action when route is not ready'
+    grep_fixed 'next_action_code' "$WORKER_SCRIPT" \
+        || fail 'Worker API does not return a stable next-action code'
+    grep_fixed 'id="actionCode"' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not show the stable next-action code'
+    grep_fixed 'id="lastChecked"' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not show dashboard freshness'
     grep_fixed 'copyStatus' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard does not provide a copy-status action'
     grep_fixed 'setTimeout(checkHealth' "$WORKER_SCRIPT" \
@@ -728,6 +744,8 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker responses do not share hardened security headers'
     grep_fixed 'ctx.waitUntil' "$WORKER_SCRIPT" \
         || fail 'Worker does not defer notification side effects with waitUntil'
+    grep_fixed 'queueHistorySideEffects(env, event, data, ctx)' "$WORKER_SCRIPT" \
+        || fail 'Worker does not defer KV history/quota side effects with waitUntil'
     grep_fixed 'WAKER_KV' "$WORKER_README" \
         || fail 'Worker README does not document optional KV history'
     grep_fixed 'DISCORD_WEBHOOK_URL' "$WORKER_README" \
@@ -772,6 +790,10 @@ test_quota_survival_layer_is_present() {
 test_worker_wake_edge_cases_are_hardened() {
     grep_fixed 'isTransientGithubStatusFailure(last)' "$WORKER_SCRIPT" \
         || fail 'Worker wake flow does not retry transient GitHub status failures'
+    grep_fixed 'githubFetchWithRetry(' "$WORKER_SCRIPT" \
+        || fail 'Worker GitHub API calls do not use bounded retry wrapper'
+    grep_fixed 'shouldRetryGithubResponse(response)' "$WORKER_SCRIPT" \
+        || fail 'Worker GitHub retry wrapper does not classify retryable HTTP failures'
     grep_fixed 'if (!last.ok && isTransientGithubStatusFailure(last)) {' "$WORKER_SCRIPT" \
         || fail 'Worker status wait does not continue after transient status failures'
     grep_fixed 'function isRouteSettlingStatus(routeProbe)' "$WORKER_SCRIPT" \
@@ -954,10 +976,22 @@ test_soft_recovery_and_route_memory_are_present() {
         || fail 'machine-readable recover JSON does not preserve the internal recovery exit code'
     grep_fixed 'recover_now --no-prompt >/dev/null 2>&1' "$SCRIPT" \
         || fail 'machine-readable recover command does not suppress human terminal output'
+    grep_fixed 'publish_subscription_export()' "$SCRIPT" \
+        || fail 'panel has no explicit subscription publishing workflow'
+    grep_fixed 'G2RAY_PUBLISH_PUBLIC_SUBSCRIPTION' "$SCRIPT" \
+        || fail 'subscription publishing is not gated by explicit consent'
+    grep_fixed 'git -C "$BASE_DIR" add -f -- "$subscription_rel"' "$SCRIPT" \
+        || fail 'subscription publishing does not force-stage the ignored base64 export only'
     grep_fixed 'tar -C "$tmp" -czf "$out" .' "$SCRIPT" \
         || fail 'support bundle archive creation is not safe for relative output paths'
     grep_fixed '--doctor-json' "$SCRIPT" \
         || fail 'panel has no headless doctor JSON command'
+    grep_fixed '"${1:-}" == "--status" || "${1:-}" == "status"' "$SCRIPT" \
+        || fail 'panel has no short headless status command'
+    grep_fixed '"${1:-}" == "--start" || "${1:-}" == "start"' "$SCRIPT" \
+        || fail 'panel has no short headless start command'
+    grep_fixed '"${1:-}" == "--refresh-exports" || "${1:-}" == "--export" || "${1:-}" == "export"' "$SCRIPT" \
+        || fail 'panel has no headless export refresh command'
     grep_fixed 'print_doctor_json()' "$SCRIPT" \
         || fail 'doctor JSON renderer is missing'
     grep_fixed 'doctor_port=443' "$SCRIPT" \
@@ -1163,8 +1197,23 @@ test_docs_cover_panel_waker_setup() {
         || fail 'README does not document the post-pull runtime refresh command'
     grep_fixed '`--recover-now` is non-interactive and soft-only' "$README" \
         || fail 'README does not clarify headless recover limitations'
+    grep_fixed 'bash ./g2ray.sh publish-subscription --yes --push' "$README" \
+        || fail 'README does not document the explicit subscription publish helper'
+    grep_fixed 'Raw subscription URL' "$SCRIPT" \
+        || fail 'panel does not label raw GitHub subscription URLs accurately'
+    if grep_fixed 'Private subscription URL' "$SCRIPT"; then
+        fail 'panel still labels raw GitHub subscription URLs as private'
+    fi
+    grep_fixed 'Option `49) Toggle Latency Focus Mode`' "$README" \
+        || fail 'README does not document latency focus mode'
+    grep_fixed 'G2RAY_LATENCY_FOCUS=1' "$README" \
+        || fail 'README does not document the latency focus environment flag'
     grep_fixed 'wake attempts' "$WORKER_README" \
         || fail 'Worker README overstates or omits alert trigger scope'
+    grep_fixed 'next_action_code' "$WORKER_README" \
+        || fail 'Worker README does not document stable next-action codes'
+    grep_fixed 'history_deferred: true' "$WORKER_README" \
+        || fail 'Worker README does not document deferred KV history writes'
     grep_fixed 'Do not paste the GitHub token into G2ray' "$WORKER_README" \
         || fail 'Worker README does not mirror the token handling warning'
     grep_fixed 'read -rsp "Wake secret: " WAKE_SECRET' "$README" \
@@ -1237,6 +1286,11 @@ test_exports_filter_unusable_fallback_routes() {
         || fail 'generate_ip_links still exports raw fallback candidates'
     grep_fixed 'address=$(usable_fallback_ips | head -1 || true)' "$SCRIPT" \
         || fail 'recommended IP link does not prefer a usable fallback route'
+    grep_fixed '[[ " $emitted " == *" $ip "* ]] && continue' "$SCRIPT" \
+        || fail 'fallback export fill path does not skip routes already emitted from cache'
+    if grep_fixed '(( count > 0 )) && return 0' "$SCRIPT"; then
+        fail 'fresh-but-partial route cache can still stop fallback exports before filling available slots'
+    fi
     pass 'fallback exports filter unusable route IPs'
 }
 
@@ -1331,6 +1385,12 @@ test_ci_runs_static_regressions() {
     [[ -f "$CI_WORKFLOW" ]] || fail 'static test GitHub Actions workflow is missing'
     grep_fixed 'bash -n ./g2ray.sh' "$CI_WORKFLOW" \
         || fail 'CI workflow does not syntax-check g2ray.sh'
+    grep_fixed 'shellcheck -S error' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not run ShellCheck for critical shell issues'
+    grep_fixed 'node --check ./worker/codespace-waker/src/index.js' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not syntax-check the Worker script'
+    grep_fixed 'wrangler@4 deploy worker/codespace-waker/src/index.js' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not dry-run bundle the Worker with Wrangler'
     grep_fixed 'bash ./tests/g2ray_static_tests.sh' "$CI_WORKFLOW" \
         || fail 'CI workflow does not run the static regression suite'
     grep_fixed 'bash ./tests/g2ray_behavior_tests.sh' "$CI_WORKFLOW" \
@@ -1339,7 +1399,7 @@ test_ci_runs_static_regressions() {
         || fail 'CI workflow does not run the Worker behavior suite'
     grep_fixed 'LC_ALL: C.UTF-8' "$CI_WORKFLOW" \
         || fail 'CI workflow does not pin a UTF-8 locale for README/static text checks'
-    pass 'CI runs shell syntax, static regressions, panel behavior, and Worker behavior regressions'
+    pass 'CI runs shell syntax, ShellCheck, Worker syntax/bundle, panel behavior, and Worker behavior regressions'
 }
 
 test_xhttp_route_settling_is_observable() {
@@ -1402,6 +1462,8 @@ test_docs_and_public_configs_are_consistent() {
         || fail 'README does not tell users to verify the observed exit location'
     grep_fixed 'Community Donated Configs (SUB)</summary>' "$README" \
         || fail 'README community subscription summary is not wrapped in a details block'
+    grep_fixed 'Community configs are public third-party endpoints' "$README" \
+        || fail 'README does not warn that community configs are public third-party endpoints'
     if grep_fixed 'without impacting your own speed or exposing personal data' "$README"; then
         fail 'README still claims donated live configs expose no personal data'
     fi
@@ -1472,6 +1534,10 @@ test_menu_loop_and_link_output_are_tidy() {
         || fail 'wait_for_port does not show elapsed initialization time'
     grep_fixed 'Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))' "$SCRIPT" \
         || fail 'anti-sleep toggle menu item does not show the current state inline'
+    grep_fixed 'Toggle Latency Focus Mode ($(echo -e "$_LATENCY_LABEL"))' "$SCRIPT" \
+        || fail 'latency focus toggle menu item does not show the current state inline'
+    grep_fixed 'latency_focus_enabled()' "$SCRIPT" \
+        || fail 'latency focus mode helper is missing'
     if awk '
         /case \$_choice in/ { in_menu=1; next }
         in_menu && /^[[:space:]]*1\)/ { in_config=1; next }

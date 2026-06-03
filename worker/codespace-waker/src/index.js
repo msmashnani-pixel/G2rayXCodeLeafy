@@ -71,24 +71,22 @@ async function handleWake(request, env, ctx) {
 
   const data = withSurvivalFields(await startCodespaceData(context.codespaceName, context.token, env), env);
   data.next_action = data.next_action || nextActionForWake(data, data.route_probe || {});
+  data.next_action_code = data.next_action_code || nextActionCodeFor(data, data.route_probe || {});
   const responseStatus = responseStatusFor(data);
   applyResponseHints(data, responseStatus, env);
   const event = eventFromResult("wake", context.codespaceName, data);
-  const historyRecorded = await recordHistory(env, {
-    ...event,
-    history_recorded_at: new Date().toISOString()
-  });
-  const quotaIncident = await recordQuotaIncident(env, event, data);
+  const sideEffects = await queueHistorySideEffects(env, event, data, ctx);
   const notifications = await queueNotifications(env, event, ctx);
   await rememberSuccessfulWake(context.codespaceName, env, data);
 
   return json({
     ...data,
     history_enabled: Boolean(env.WAKER_KV),
-    history_recorded: historyRecorded,
-    quota_incident_recorded: quotaIncident.recorded,
-    quota_drought_active: quotaIncident.incident
-      ? quotaIncident.incident.quota_drought_active === true
+    history_recorded: sideEffects.history_recorded,
+    history_deferred: sideEffects.deferred,
+    quota_incident_recorded: sideEffects.quota_incident_recorded,
+    quota_drought_active: sideEffects.quota_incident
+      ? sideEffects.quota_incident.quota_drought_active === true
       : data.quota_blocked === true,
     notification_status: notifications.status,
     notifications_deferred: notifications.deferred,
@@ -103,8 +101,9 @@ async function handleHealth(request, env, ctx) {
   const url = new URL(request.url);
   const checkRoute = url.searchParams.get("route") !== "false";
   const codespaceName = context.codespaceName;
-  const status = await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN);
-  const routeProbe = status.ok && checkRoute
+  const status = await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN, env);
+  const routeChecked = status.ok && checkRoute;
+  const routeProbe = routeChecked
     ? await waitForXhttpRoute(codespaceName, codespacePort(env), env)
     : {
         url: routeUrl(codespaceName, codespacePort(env)),
@@ -119,12 +118,16 @@ async function handleHealth(request, env, ctx) {
       };
   const data = withSurvivalFields({
     ...status,
-    route_checked: checkRoute,
-    route_ready: checkRoute ? isRouteReadyProbe(routeProbe) : null,
+    route_check_requested: checkRoute,
+    route_checked: routeChecked,
+    route_ready: routeChecked ? isRouteReadyProbe(routeProbe) : null,
     route_probe: routeProbe,
     next_action: status.ok && !checkRoute
       ? "Route probe skipped. Use Check Health normally when you need route readiness."
       : nextActionForWake(status, routeProbe),
+    next_action_code: status.ok && !checkRoute
+      ? "route_check_skipped"
+      : nextActionCodeFor(status, routeProbe),
     message: status.ok && !checkRoute
       ? "GitHub state checked; route probe skipped by request."
       : healthMessage(status, routeProbe)
@@ -132,20 +135,17 @@ async function handleHealth(request, env, ctx) {
   const responseStatus = responseStatusFor(data);
   applyResponseHints(data, responseStatus, env);
   const event = eventFromResult("health", codespaceName, data);
-  const historyRecorded = await recordHistory(env, {
-    ...event,
-    history_recorded_at: new Date().toISOString()
-  });
-  const quotaIncident = await recordQuotaIncident(env, event, data);
+  const sideEffects = await queueHistorySideEffects(env, event, data, ctx);
   const notifications = await queueNotifications(env, event, ctx);
 
   return json({
     ...data,
     history_enabled: Boolean(env.WAKER_KV),
-    history_recorded: historyRecorded,
-    quota_incident_recorded: quotaIncident.recorded,
-    quota_drought_active: quotaIncident.incident
-      ? quotaIncident.incident.quota_drought_active === true
+    history_recorded: sideEffects.history_recorded,
+    history_deferred: sideEffects.deferred,
+    quota_incident_recorded: sideEffects.quota_incident_recorded,
+    quota_drought_active: sideEffects.quota_incident
+      ? sideEffects.quota_incident.quota_drought_active === true
       : data.quota_blocked === true,
     notification_status: notifications.status,
     notifications_deferred: notifications.deferred,
@@ -287,10 +287,10 @@ async function startCodespaceData(name, token, env) {
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(name)}/start`;
   let res;
   try {
-    res = await fetchWithTimeout(endpoint, {
+    res = await githubFetchWithRetry(endpoint, {
       method: "POST",
       headers: githubHeaders(token)
-    }, FETCH_TIMEOUT_MS);
+    }, FETCH_TIMEOUT_MS, env);
   } catch (error) {
     return {
       ok: false,
@@ -308,7 +308,7 @@ async function startCodespaceData(name, token, env) {
   const githubFailure = githubFailureForResponse(res, body, name);
   if (githubFailure) {
     if (githubFailure.reason === "quota_or_billing_blocked") {
-      const status = await getCodespaceStatus(name, token);
+      const status = await getCodespaceStatus(name, token, env);
       return {
         ...githubFailure,
         state: status.state || null,
@@ -391,9 +391,9 @@ async function waitForCodespaceAvailable(name, token, env) {
     message: "Codespace state has not been checked yet."
   };
 
-  while (Date.now() < deadline) {
+  while (attempts === 0 || Date.now() < deadline) {
     attempts += 1;
-    last = await getCodespaceStatus(name, token);
+    last = await getCodespaceStatus(name, token, env);
     last.attempts = attempts;
     last.waited_ms = Date.now() - startedAt;
     if (!last.ok && isTransientGithubStatusFailure(last)) {
@@ -415,14 +415,14 @@ async function waitForCodespaceAvailable(name, token, env) {
   };
 }
 
-async function getCodespaceStatus(codespaceName, token) {
+async function getCodespaceStatus(codespaceName, token, env) {
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(codespaceName)}`;
   let res;
   try {
-    res = await fetchWithTimeout(endpoint, {
+    res = await githubFetchWithRetry(endpoint, {
       method: "GET",
       headers: githubHeaders(token)
-    }, FETCH_TIMEOUT_MS);
+    }, FETCH_TIMEOUT_MS, env);
   } catch (error) {
     return {
       ok: false,
@@ -762,10 +762,39 @@ function nextActionForWake(status, routeProbe) {
   return "Check panel option 14 Diagnostics; if XHTTP is not usable, use option 6 Recover Now.";
 }
 
+function nextActionCodeFor(status, routeProbe) {
+  if (status.quota_blocked || status.reason === "quota_or_billing_blocked" || Number(status.status) === 402) {
+    return "wait_for_quota_reset";
+  }
+  if (status.reason === "github_rate_limited" || status.reason === "github_secondary_rate_limited") {
+    return "wait_github_rate_limit";
+  }
+  if (status.reason === "github_token_rejected_or_missing_scope" || status.reason === "github_token_scope_missing") {
+    return "rotate_github_token";
+  }
+  if (status.reason === "codespace_not_found_or_token_cannot_access_it" || Number(status.status) === 404) {
+    return "codespace_missing_or_inaccessible";
+  }
+  if (!status.ok) return "check_github_or_token";
+  if (!isCodespaceAvailable(status)) return "wait_codespace_available";
+  if (routeProbe.error === "route_stability_not_confirmed") return "wait_route_stability";
+  if (routeProbe.usable) return "retry_vless_config";
+  if (routeProbe.route_failure_reason === "edge_or_origin_error") return "wait_or_recover_route";
+  if (routeProbe.route_failure_reason === "timeout_or_unreachable" || routeProbe.route_failure_reason === "dns_tls_or_network_unreachable") {
+    return "open_codespace_check_port";
+  }
+  if (routeProbe.http_status === 404) return "wait_route_or_recover";
+  if (routeProbe.http_status === 0) return "check_dns_port_visibility";
+  return "inspect_panel_diagnostics";
+}
+
 function healthMessage(status, routeProbe) {
   if (status.token_warning) return status.message;
   if (!status.ok) return status.message || "GitHub status is not available.";
-  if (routeProbe.usable) return "Codespace is available and the XHTTP route is usable.";
+  if (isRouteReadyProbe(routeProbe)) return "Codespace is available and the XHTTP route is usable.";
+  if (routeProbe.error === "route_stability_not_confirmed") {
+    return "Codespace is available, but the XHTTP route answered only once and still needs another stable probe.";
+  }
   if (routeProbe.http_status === 404) {
     return "Codespace exists, but the app.github.dev route is still settling or not routed.";
   }
@@ -791,12 +820,50 @@ function eventFromResult(kind, codespace, data) {
     route_waited_ms: data.route_probe ? data.route_probe.waited_ms : null,
     route_attempts: data.route_probe ? data.route_probe.attempts : null,
     reason: data.reason || null,
+    next_action_code: data.next_action_code || null,
     quota_blocked: data.quota_blocked === true,
     quota_reset_estimate_utc: data.quota_reset_estimate_utc || null,
     retention_expires_at: data.retention_expires_at || null,
     retention_risk: data.retention_risk || null,
     token_warning: data.token_warning || null,
     message: data.message || null
+  };
+}
+
+async function queueHistorySideEffects(env, event, data, ctx) {
+  if (!env.WAKER_KV) {
+    return {
+      history_recorded: false,
+      quota_incident_recorded: false,
+      quota_incident: null,
+      deferred: false
+    };
+  }
+
+  const quotaIncident = await recordQuotaIncident(env, event, data);
+  const historyTask = recordHistory(env, {
+    ...event,
+    history_recorded_at: new Date().toISOString()
+  });
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(historyTask.catch((error) => {
+      console.warn("history_side_effect_failed", shortError(error));
+    }));
+    return {
+      history_recorded: true,
+      quota_incident_recorded: quotaIncident.recorded,
+      quota_incident: quotaIncident.incident,
+      deferred: true
+    };
+  }
+
+  const historyRecorded = await historyTask;
+  return {
+    history_recorded: historyRecorded,
+    quota_incident_recorded: quotaIncident.recorded,
+    quota_incident: quotaIncident.incident,
+    deferred: false
   };
 }
 
@@ -822,7 +889,9 @@ async function recordQuotaIncident(env, event, data) {
       ...existing,
       codespace: event.codespace,
       last_observed_at: nowIso,
-      quota_reset_estimate_utc: data.quota_reset_estimate_utc || existing.quota_reset_estimate_utc || null,
+      quota_reset_estimate_utc: existing.quota_drought_active === true && !data.quota_blocked
+        ? existing.quota_reset_estimate_utc || data.quota_reset_estimate_utc || null
+        : data.quota_reset_estimate_utc || existing.quota_reset_estimate_utc || null,
       retention_period_minutes: data.retention_period_minutes ?? existing.retention_period_minutes ?? null,
       retention_expires_at: data.retention_expires_at || existing.retention_expires_at || null,
       retention_risk: data.retention_risk || existing.retention_risk || "unknown"
@@ -923,7 +992,7 @@ async function handleQuotaSurvivalCron(controller, env) {
   const data = withSurvivalFields(
     nearReset
       ? await startCodespaceData(codespaceName, env.GITHUB_TOKEN, env)
-      : await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN),
+      : await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN, env),
     env
   );
   const event = eventFromResult(nearReset ? "cron_wake" : "cron_health", codespaceName, data);
@@ -1032,7 +1101,7 @@ function hasNotificationChannels(env) {
 }
 
 function shouldNotify(event) {
-  if (event.reason === "github_token_rejected_or_missing_scope") return true;
+  if (event.reason === "github_token_rejected_or_missing_scope" || event.reason === "github_token_scope_missing") return true;
   if (event.kind !== "wake") return false;
   if (event.route_ready) return true;
   return event.route_http_status === 404 || !event.ok;
@@ -1221,6 +1290,36 @@ async function fetchWithTimeout(input, init = {}, timeoutMs = FETCH_TIMEOUT_MS) 
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function githubFetchWithRetry(input, init = {}, timeoutMs = FETCH_TIMEOUT_MS, env = {}) {
+  const attempts = configuredNumber(env, "GITHUB_API_RETRY_ATTEMPTS", 2, 1, 4);
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(input, init, timeoutMs);
+      if (attempt < attempts && shouldRetryGithubResponse(response)) {
+        await sleep(githubRetryDelayMs(env, attempt));
+        continue;
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      await sleep(githubRetryDelayMs(env, attempt));
+    }
+  }
+  throw lastError || new Error("github_fetch_failed");
+}
+
+function shouldRetryGithubResponse(response) {
+  const status = Number(response && response.status || 0);
+  return status === 502 || status === 503 || status === 504;
+}
+
+function githubRetryDelayMs(env, attempt) {
+  const base = configuredMs(env, "GITHUB_API_RETRY_BACKOFF_MS", 500, 0, 5000);
+  return Math.min(5000, base * Math.max(1, attempt));
 }
 
 function routeUrl(name, port) {
@@ -1444,6 +1543,8 @@ function renderDashboard() {
     <div class="grid">
       <div class="metric"><span>GitHub state</span><strong id="githubState">Not checked</strong></div>
       <div class="metric"><span>Route</span><strong id="routeState">Not checked</strong></div>
+      <div class="metric"><span>Last checked</span><strong id="lastChecked">Not checked</strong></div>
+      <div class="metric"><span>Action code</span><strong id="actionCode">Not checked</strong></div>
       <div class="metric"><span>Latency</span><strong id="latency">Not checked</strong></div>
       <div class="metric"><span>Idle timeout</span><strong id="idleTimeout">Not checked</strong></div>
       <div class="metric"><span>Last used</span><strong id="lastUsed">Not checked</strong></div>
@@ -1630,12 +1731,15 @@ function stopPolling() {
 function renderResult(data) {
   const route = data.route_probe || {};
   const routeReady = data.route_ready === true;
+  const checkedAt = new Date().toISOString();
   pollAfterSeconds = Number.isFinite(Number(data.poll_after_seconds || data.retry_after_seconds))
     ? Number(data.poll_after_seconds || data.retry_after_seconds)
     : 5;
   document.getElementById("githubState").textContent = data.state || (data.ok ? "Available" : "Problem");
   document.getElementById("routeState").textContent = routeReady ? "Route ready" : route.http_status ? "HTTP " + route.http_status : "Not reachable";
   document.getElementById("routeState").className = routeReady ? "good" : route.http_status === 404 ? "warn" : "bad";
+  document.getElementById("lastChecked").textContent = checkedAt;
+  document.getElementById("actionCode").textContent = data.next_action_code || "unknown";
   document.getElementById("latency").textContent = route.latency_ms == null ? "Unknown" : route.latency_ms + "ms";
   document.getElementById("idleTimeout").textContent = data.idle_timeout_minutes ? data.idle_timeout_minutes + " minutes" : "Unknown";
   document.getElementById("lastUsed").textContent = data.last_used_at || "Unknown";
@@ -1658,6 +1762,8 @@ function renderResult(data) {
     "route_ready=" + routeReady,
     "route_http_status=" + (route.http_status || "unknown"),
     "latency_ms=" + (route.latency_ms == null ? "unknown" : route.latency_ms),
+    "checked_at=" + checkedAt,
+    "next_action_code=" + (data.next_action_code || "unknown"),
     "quota_blocked=" + Boolean(data.quota_blocked),
     "retention_risk=" + (data.retention_risk || "unknown"),
     "quota_reset_estimate_utc=" + (data.quota_reset_estimate_utc || "unknown"),
@@ -1707,8 +1813,10 @@ function renderHistory(data) {
     item.className = "event";
     item.textContent = [
       event.ts,
+      event.ts ? "age=" + ageText(event.ts) : "",
       event.kind,
       "ok=" + event.ok,
+      event.next_action_code ? "action=" + event.next_action_code : "",
       "route_ready=" + event.route_ready,
       "http=" + (event.route_http_status || "unknown"),
       "latency=" + (event.route_latency_ms == null ? "unknown" : event.route_latency_ms + "ms"),
@@ -1818,6 +1926,18 @@ function shortTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value).slice(0, 16);
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function ageText(value) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "unknown";
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return seconds + "s";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return minutes + "m";
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return hours + "h";
+  return Math.floor(hours / 24) + "d";
 }
 
 function renderError(error) {

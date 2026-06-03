@@ -82,6 +82,7 @@ async function testGithubRateLimitClassification() {
   assert.equal(body.reason, "github_rate_limited");
   assert.equal(body.retry_after_epoch, resetEpoch);
   assert.match(body.next_action, /GitHub is throttling/);
+  assert.equal(body.next_action_code, "wait_github_rate_limit");
   console.log("PASS: Worker classifies GitHub primary rate limits");
 }
 
@@ -143,6 +144,7 @@ async function testWakeSettlingIncludesRetryMetadata() {
   assert.equal(body.retry_after_seconds, 5);
   assert.equal(body.poll_after_seconds, 5);
   assert.equal(body.route_probe.route_failure_reason, "route_settling_404");
+  assert.equal(body.next_action_code, "wait_route_or_recover");
   console.log("PASS: Worker settling responses include retry and route failure metadata");
 }
 
@@ -175,6 +177,7 @@ async function testHealthCanSkipRouteProbe() {
   assert.equal(response.status, 200);
   assert.equal(body.route_checked, false);
   assert.equal(body.route_ready, null);
+  assert.equal(body.next_action_code, "route_check_skipped");
   assert.equal(routeCalls, 0);
   const history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
   assert.equal(history.history[0].route_checked, false);
@@ -276,6 +279,52 @@ async function testGithubHttp429Classification() {
   assert.equal(body.retry_after_epoch, 1780000123);
   assert.match(body.next_action, /GitHub is throttling/);
   console.log("PASS: Worker classifies GitHub HTTP 429 rate limits");
+}
+
+async function testGithubStartRetriesTransientServerFailure() {
+  let startCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      startCalls += 1;
+      if (startCalls === 1) {
+        return new Response(JSON.stringify({ message: "temporary unavailable" }), {
+          status: 503,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify({ state: "Available" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+    GITHUB_API_RETRY_BACKOFF_MS: "0"
+  }), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(startCalls, 2);
+  assert.equal(body.route_ready, true);
+  assert.equal(body.next_action_code, "retry_vless_config");
+  console.log("PASS: Worker retries transient GitHub start server failures once");
 }
 
 async function testQuotaBlockIncludesSurvivalFields() {
@@ -453,6 +502,43 @@ async function testKvQuotaIncidentHistoryRecordsBlockedAndRecovery() {
   console.log("PASS: Worker KV quota incident history records blocked and recovery states");
 }
 
+async function testQuotaIncidentKeepsResetEstimateDuringActiveDroughtHealthChecks() {
+  const kv = makeKv();
+  await kv.put("quota-incident:behavior-space", JSON.stringify({
+    codespace: "behavior-space",
+    quota_drought_active: true,
+    first_quota_blocked_at: "2026-06-15T12:00:00.000Z",
+    latest_quota_blocked_at: "2026-06-15T12:00:00.000Z",
+    quota_reset_estimate_utc: "2026-07-01T00:00:00Z"
+  }));
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        retention_period_minutes: 43200,
+        last_used_at: "2026-07-01T00:05:00Z"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = baseEnv({ WAKER_KV: kv, TEST_NOW_UTC: "2026-07-01T00:05:00Z" });
+  const response = await worker.fetch(makeRequest("/api/health?route=false"), env, {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.quota_drought_active, true);
+  const history = await responseJson(await worker.fetch(makeRequest("/api/history"), env, {}));
+  assert.equal(history.quota_incident.quota_drought_active, true);
+  assert.equal(history.quota_incident.quota_reset_estimate_utc, "2026-07-01T00:00:00Z");
+  console.log("PASS: Worker preserves active quota incident reset estimate across cheap health checks");
+}
+
 async function testScheduledQuotaCronIsDisabledAndThrottledBeforeReset() {
   const kv = makeKv();
   await kv.put("quota-incident:behavior-space", JSON.stringify({
@@ -601,6 +687,7 @@ async function testWakeFailureIncludesNextAction() {
   assert.equal(response.status, 401);
   assert.equal(body.reason, "github_token_rejected_or_missing_scope");
   assert.match(body.next_action, /Rotate the GitHub token/);
+  assert.equal(body.next_action_code, "rotate_github_token");
   console.log("PASS: Worker wake failures include actionable next_action");
 }
 
@@ -631,6 +718,7 @@ async function testHealthTreatsHttp400RouteAsUsable() {
   assert.equal(response.status, 200);
   assert.equal(body.route_ready, true);
   assert.equal(body.route_probe.http_status, 400);
+  assert.equal(body.next_action_code, "retry_vless_config");
   assert.equal(body.message, "Codespace is available and the XHTTP route is usable.");
   console.log("PASS: Worker route readiness matches panel HTTP 400/200 semantics");
 }
@@ -798,6 +886,7 @@ async function testHealthRequiresStableRouteReadiness() {
   assert.equal(body.route_probe.stable_probes, 1);
   assert.equal(body.route_probe.error, "route_stability_not_confirmed");
   assert.equal(body.route_probe.route_failure_reason, "route_stability_not_confirmed");
+  assert.doesNotMatch(body.message, /route is usable/i);
   assert.equal(routeCalls, 1);
   console.log("PASS: Worker health requires stable route readiness");
 }
@@ -1022,6 +1111,51 @@ async function testHealthQueuesTokenFailureNotificationWithWaitUntil() {
   console.log("PASS: Worker queues health token-failure notifications with waitUntil");
 }
 
+async function testHealthQueuesMissingScopeNotificationAndDoesNotCountRouteCheck() {
+  const kv = makeKv();
+  let routeCalls = 0;
+  let notificationCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({ message: "Resource not accessible by personal access token" }), {
+        status: 403,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 404 });
+    }
+    if (url.includes("discord.example")) {
+      notificationCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const waitUntilPromises = [];
+  const response = await worker.fetch(
+    makeRequest("/api/health"),
+    baseEnv({ WAKER_KV: kv, DISCORD_WEBHOOK_URL: "https://discord.example/hook" }),
+    { waitUntil(promise) { waitUntilPromises.push(promise); } }
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 403);
+  assert.equal(body.reason, "github_token_scope_missing");
+  assert.equal(body.route_checked, false);
+  assert.equal(body.route_ready, null);
+  assert.equal(body.notification_status, "deferred");
+  assert.equal(waitUntilPromises.length, 2);
+  await Promise.all(waitUntilPromises);
+  const history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
+  assert.equal(history.history[0].route_checked, false);
+  assert.equal(history.history[0].route_ready, null);
+  assert.equal(routeCalls, 0);
+  assert.equal(notificationCalls, 1);
+  console.log("PASS: Worker notifies missing-scope health failures without counting a route probe");
+}
+
 async function testDeferredNotificationFailureIsMarkedDeferred() {
   let routeCalls = 0;
   let notificationCalls = 0;
@@ -1077,6 +1211,49 @@ async function testDeferredNotificationFailureIsMarkedDeferred() {
   console.log("PASS: Worker marks deferred notification failures as deferred");
 }
 
+async function testHistorySideEffectsCanDeferWithWaitUntil() {
+  const kv = makeKv();
+  let routeCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const waitUntilPromises = [];
+  const response = await worker.fetch(
+    makeRequest("/api/health"),
+    baseEnv({ WAKER_KV: kv }),
+    { waitUntil(promise) { waitUntilPromises.push(promise); } }
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.history_recorded, true);
+  assert.equal(body.history_deferred, true);
+  assert.equal(waitUntilPromises.length, 1);
+  await Promise.all(waitUntilPromises);
+  const history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
+  assert.equal(history.history.length, 1);
+  assert.equal(history.history[0].next_action_code, "retry_vless_config");
+  assert.equal(routeCalls >= 2, true);
+  console.log("PASS: Worker defers KV history side effects through waitUntil");
+}
+
 try {
   await testFailedSecretRateLimit();
   await testGithubRateLimitClassification();
@@ -1086,10 +1263,12 @@ try {
   await testHealthSkipRoutePreservesGithubFailureGuidance();
   await testAuthorizedWakeCooldownIsOptional();
   await testGithubHttp429Classification();
+  await testGithubStartRetriesTransientServerFailure();
   await testQuotaBlockIncludesSurvivalFields();
   await testRetentionMissingFieldsAreUnknown();
   await testMonthlyResetEstimateCrossesYear();
   await testKvQuotaIncidentHistoryRecordsBlockedAndRecovery();
+  await testQuotaIncidentKeepsResetEstimateDuringActiveDroughtHealthChecks();
   await testScheduledQuotaCronIsDisabledAndThrottledBeforeReset();
   await testScheduledQuotaCronAttemptsOneNearResetWake();
   await testWakeFailureIncludesNextAction();
@@ -1105,7 +1284,9 @@ try {
   await testWakeQueuesNotificationsWithWaitUntil();
   await testWakeReportsNoNotificationsWhenChannelsAreUnconfigured();
   await testHealthQueuesTokenFailureNotificationWithWaitUntil();
+  await testHealthQueuesMissingScopeNotificationAndDoesNotCountRouteCheck();
   await testDeferredNotificationFailureIsMarkedDeferred();
+  await testHistorySideEffectsCanDeferWithWaitUntil();
 } finally {
   globalThis.fetch = originalFetch;
 }

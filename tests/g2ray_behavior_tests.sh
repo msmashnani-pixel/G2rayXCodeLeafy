@@ -32,6 +32,9 @@ reset_runtime_paths() {
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
     LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
+    LATENCY_FOCUS_FILE="$DATA_DIR/latency_focus_mode"
+    LATENCY_FOCUS_DISABLED_FILE="$DATA_DIR/latency_focus_mode_disabled"
+    SUBSCRIPTION_FILE="$TMP_ROOT/configs-subscription-base64.txt"
     CONFIG_META_FILE="$TMP_ROOT/configs-meta.json"
     LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
     PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
@@ -471,6 +474,33 @@ EOF
     pass "usable fallback exports use fresh cached route health"
 }
 
+test_usable_fallback_ips_fills_partial_fresh_cache() {
+    reset_runtime_paths
+    ROUTE_HEALTH_TTL_SEC=300
+    MAX_FALLBACK_LINKS=4
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-05-30T00:00:00Z	20.0.0.5	200	70	true
+2026-05-30T00:00:00Z	20.0.0.6	200	80	true
+EOF
+    resolve_domain_ips() {
+        printf '%s\n' 20.0.0.5 20.0.0.6 20.0.0.7 20.0.0.8 20.0.0.9
+    }
+    local probes_file="$TMP_ROOT/partial-cache-probes.txt"
+    : > "$probes_file"
+    xhttp_probe_metrics() {
+        printf '%s\n' "$2" >> "$probes_file"
+        printf '200 60 ready\n'
+    }
+
+    mapfile -t routes < <(usable_fallback_ips)
+    [[ "${routes[*]}" == "20.0.0.5 20.0.0.6 20.0.0.7 20.0.0.8" ]] \
+        || fail "usable_fallback_ips did not fill partial cached routes with live probes"
+    ! grep -Fq '20.0.0.5' "$probes_file" \
+        || fail "usable_fallback_ips live-probed a route already emitted from cache"
+    pass "usable fallback exports fill partial fresh cache with live-probed routes"
+}
+
 test_usable_fallback_ips_caps_live_probe_fallback() {
     reset_runtime_paths
     MAX_FALLBACK_LINKS=1
@@ -569,6 +599,70 @@ test_low_overhead_env_can_be_overridden_by_toggle() {
     pass "low-overhead mode can be explicitly toggled even when env default is enabled"
 }
 
+test_low_overhead_keeps_important_state_logs() {
+    reset_runtime_paths
+    enable_low_overhead_mode
+    log_event INFO "health chatty_probe_should_skip"
+    log_event INFO "runtime_ready reason=test engine=started xhttp_probe=200"
+    ! grep -Fq "chatty_probe_should_skip" "$LOG_FILE" || fail "low overhead did not suppress chatty health INFO"
+    grep -Fq "runtime_ready reason=test" "$LOG_FILE" || fail "low overhead suppressed important runtime_ready INFO"
+    disable_low_overhead_mode
+    pass "low-overhead mode preserves important state-transition INFO logs"
+}
+
+test_latency_focus_mode_suppresses_noncritical_logs() {
+    reset_runtime_paths
+    enable_latency_focus_mode
+    log_event INFO "latency_focus_info_should_skip"
+    log_event WARN "latency_focus_warn_should_skip"
+    log_event ERROR "latency_focus_error_should_stay"
+    ! grep -Fq "latency_focus_info_should_skip" "$LOG_FILE" || fail "latency focus mode did not suppress INFO logs"
+    ! grep -Fq "latency_focus_warn_should_skip" "$LOG_FILE" || fail "latency focus mode did not suppress WARN logs"
+    grep -Fq "latency_focus_error_should_stay" "$LOG_FILE" || fail "latency focus mode suppressed ERROR logs"
+    disable_latency_focus_mode
+    pass "latency-focus mode suppresses noncritical logs while preserving errors"
+}
+
+test_latency_focus_env_can_be_overridden_by_toggle() {
+    reset_runtime_paths
+    G2RAY_LATENCY_FOCUS=1
+    latency_focus_enabled || fail "latency focus env flag did not enable mode"
+    disable_latency_focus_mode
+    if latency_focus_enabled; then
+        fail "latency focus disable toggle did not override the env flag"
+    fi
+    enable_latency_focus_mode
+    latency_focus_enabled || fail "latency focus enable toggle did not re-enable mode"
+    unset G2RAY_LATENCY_FOCUS
+    disable_latency_focus_mode
+    pass "latency-focus mode can be explicitly toggled even when env default is enabled"
+}
+
+test_git_remote_repo_slug_prefers_branch_upstream() {
+    reset_runtime_paths
+    (
+        BASE_DIR="$TMP_ROOT/repo-slug"
+        git() {
+            case "$*" in
+                *"rev-parse --abbrev-ref --symbolic-full-name @{u}"*) printf 'origin/main\n'; return 0 ;;
+                *"config --get remote.origin.url"*) printf 'https://github.com/owner/repo.git\n'; return 0 ;;
+                *"config --get remote.shaun.url"*) printf 'https://github.com/wrong/repo.git\n'; return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        [[ "$(git_remote_repo_slug)" == "owner/repo" ]] || fail "subscription URL repo slug did not prefer branch upstream remote"
+    )
+    pass "subscription URL repo slug follows the current branch upstream"
+}
+
+test_subscription_url_warning_is_available() {
+    reset_runtime_paths
+    subscription_url_warning 2>"$TMP_ROOT/subscription-warning.txt"
+    grep -Fq "Base64 is not encryption" "$TMP_ROOT/subscription-warning.txt" \
+        || fail "subscription URL warning does not explain base64/public exposure"
+    pass "subscription URL warning explains public credential exposure"
+}
+
 test_performance_profile_settings_are_available() {
     reset_runtime_paths
     local balanced low_latency low_overhead
@@ -612,6 +706,7 @@ test_doctor_json_reports_probe_state() {
     grep -Fq '"edge_probe": {"http_status": 404' <<< "$output" || fail "doctor json missing edge probe"
     grep -Fq '"structured_log_file":' <<< "$output" || fail "doctor json missing structured log path"
     grep -Fq '"diagnostic_log_file":' <<< "$output" || fail "doctor json missing diagnostic log path"
+    grep -Fq '"latency_focus": false' <<< "$output" || fail "doctor json missing latency focus state"
     pass "doctor json reports machine-readable route state"
 }
 
@@ -949,6 +1044,46 @@ test_support_bundle_marks_unreadable_optional_logs() {
     pass "support bundle marks unreadable optional logs"
 }
 
+test_publish_subscription_requires_consent_and_stages_only_subscription_file() {
+    reset_runtime_paths
+    (
+        BASE_DIR="$TMP_ROOT"
+        SUBSCRIPTION_FILE="$TMP_ROOT/configs-subscription-base64.txt"
+        local calls_file="$TMP_ROOT/git-publish-calls.txt"
+        : > "$calls_file"
+        refresh_config_exports() {
+            printf 'dmxlc3M6Ly9leGFtcGxlCg==' > "$SUBSCRIPTION_FILE"
+            return 0
+        }
+        subscription_url() {
+            printf 'https://raw.githubusercontent.com/owner/repo/main/configs-subscription-base64.txt'
+        }
+        git() {
+            printf '%s\n' "$*" >> "$calls_file"
+            case "$*" in
+                *"rev-parse --is-inside-work-tree"*) return 0 ;;
+                *"diff --cached --quiet"*) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+
+        if publish_subscription_export >/dev/null 2>"$TMP_ROOT/publish-denied.err"; then
+            fail "subscription publish succeeded without explicit consent"
+        fi
+        grep -Fq "exposes live VLESS credentials" "$TMP_ROOT/publish-denied.err" \
+            || fail "subscription publish did not warn about public credential exposure"
+
+        G2RAY_PUBLISH_PUBLIC_SUBSCRIPTION=1 publish_subscription_export >/dev/null
+        grep -Fq "add -f -- configs-subscription-base64.txt" "$calls_file" \
+            || fail "subscription publish did not force-stage the ignored base64 export"
+        grep -Fq "commit -m Update subscription export" "$calls_file" \
+            || fail "subscription publish did not create an update commit"
+        ! grep -Fq "configs-to-copy-for-mobile.txt" "$calls_file" \
+            || fail "subscription publish staged the raw mobile config file"
+    )
+    pass "subscription publishing is explicit and stages only the base64 subscription export"
+}
+
 test_port_visibility_is_throttled
 test_runtime_lock_serializes_operations_and_allows_reentry
 test_port_visibility_cache_is_scoped_by_codespace_and_port
@@ -969,12 +1104,18 @@ test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source
 test_last_known_state_scans_full_current_log
 test_usable_fallback_ips_uses_fresh_cache
+test_usable_fallback_ips_fills_partial_fresh_cache
 test_usable_fallback_ips_caps_live_probe_fallback
 test_boot_status_helpers_record_silent_start_result
 test_config_exports_write_metadata_and_subscription_url
 test_config_metadata_sanitizes_invalid_max_fallback_links
 test_low_overhead_mode_suppresses_info_logs
 test_low_overhead_env_can_be_overridden_by_toggle
+test_low_overhead_keeps_important_state_logs
+test_latency_focus_mode_suppresses_noncritical_logs
+test_latency_focus_env_can_be_overridden_by_toggle
+test_git_remote_repo_slug_prefers_branch_upstream
+test_subscription_url_warning_is_available
 test_performance_profile_settings_are_available
 test_route_settling_history_records_summary
 test_doctor_json_reports_probe_state
@@ -991,3 +1132,4 @@ test_support_bundle_redacts_sensitive_material
 test_support_bundle_handles_relative_log_dir
 test_support_bundle_includes_rotated_logs
 test_support_bundle_marks_unreadable_optional_logs
+test_publish_subscription_requires_consent_and_stages_only_subscription_file

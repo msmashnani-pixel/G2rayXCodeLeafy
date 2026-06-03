@@ -46,6 +46,8 @@ Want to use public nodes donated by other G2ray users? Import this raw newline-s
 https://raw.githubusercontent.com/shayanay80atomic/G2rayXCodeLeafy/main/configs.txt
 ```
 
+Community configs are public third-party endpoints. Treat them as untrusted, best-effort test nodes and do not use them for sensitive traffic.
+
 </details>
 
 ---
@@ -120,6 +122,7 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_ROUTE_FAILURE_COOLDOWN_SEC` **(Optional)** — Seconds to temporarily skip candidates that timed out or returned edge/origin errors. Default: `180`.
 - `G2RAY_PERFORMANCE_PROFILE` **(Optional)** — Config profile used when generating a new Xray config: `balanced` (default), `low_latency`, `streaming`, `unstable_mobile`, or `low_overhead`.
 - `G2RAY_LOW_OVERHEAD=1` **(Optional)** — Starts the panel in low-overhead mode, reducing INFO logs and less-essential background route/export refreshes. You can also toggle this from option `18`.
+- `G2RAY_LATENCY_FOCUS=1` **(Optional)** — Starts the panel in latency-focus mode, keeping heartbeat/self-heal active while suppressing noncritical logs and minimizing background route/export refreshes. You can also toggle this from option `49`.
 - `G2RAY_PORT_PUBLIC_TTL_SEC` **(Optional)** — Seconds to trust the last successful `gh codespace ports visibility 443:public` call before calling GitHub again. Default: `300`.
 - `G2RAY_WAKER_TEST_TIMEOUT_SEC` **(Optional)** — Seconds the panel waits when testing the Cloudflare Worker from option `15) Recovery / Waker Setup`. Default: `180`.
 - `G2RAY_EDGE_RECONNECT_THRESHOLD` **(Optional)** — Number of consecutive unreachable edge checks before self-heal may run a full reconnect. Default: `3`.
@@ -207,8 +210,13 @@ Headless recovery/status commands:
 bash ./g2ray.sh --recover-now
 bash ./g2ray.sh --recover-now --json
 bash ./g2ray.sh --doctor-json
+bash ./g2ray.sh status
+bash ./g2ray.sh start
+bash ./g2ray.sh export
 bash ./g2ray.sh --support-bundle
 bash ./g2ray.sh --print-subscription-url
+bash ./g2ray.sh publish-subscription --yes --push
+bash ./g2ray.sh latency-focus on
 ```
 
 `--recover-now` is non-interactive and soft-only: it verifies/starts Xray, reasserts public port visibility, waits for route readiness, refreshes route candidates, and refreshes exported configs. If the route is still settling, it can exit nonzero; open the interactive panel and use option `6) Recover Now` if you want the hard restart prompt.
@@ -218,6 +226,8 @@ bash ./g2ray.sh --print-subscription-url
 `--support-bundle` creates a redacted `.tar.gz` support bundle under `logs/`. It includes doctor JSON, diagnostics, structured event logs, route health, rolling route stats, route-settling history, and Xray logs while redacting VLESS links, UUIDs, bearer tokens, GitHub tokens, and wake secrets.
 
 `--print-subscription-url` prints the raw-GitHub URL where `configs-subscription-base64.txt` would be available if you publish that export yourself. Generated config exports are ignored by default because they contain live VLESS credentials; the base64 subscription is encoding, not encryption. Most VLESS clients cannot authenticate to a private GitHub raw URL, so a subscription URL is directly usable only when the file is publicly reachable or served through a client-compatible private endpoint. Prefer local/private distribution; if you intentionally publish a public subscription, rotate the UUID afterward when you want to revoke access, and do not publish `configs-to-copy-for-mobile.txt` or `configs-meta.json`.
+
+`publish-subscription --yes --push` is an explicit opt-in helper for clients that need one subscription URL they can refresh. It refreshes exports, force-stages only `configs-subscription-base64.txt`, commits it, pushes when `--push` is provided, then prints the same raw-GitHub subscription URL. Use it only when you intentionally want that repository/branch to expose the live configs; anyone who can read that URL can import them. To revoke a published subscription, generate a new config/UUID and publish again, or remove the file from the branch.
 
 After `git pull`, reattach the panel or run:
 
@@ -235,6 +245,8 @@ Option `16) Live Monitor` is a foreground status screen for intentional terminal
 Option `17) Route Candidates` opens the Route Candidates manager. It shows measured route IPs with last latency, average latency, recent weighted latency, success ratio, source, and failure reason; lets you add a manual IPv4 candidate, pin a preferred route, blacklist a bad route, unblacklist/remove entries, reset measured route health without wiping preferences, explicitly reset all route preferences, and refresh exports. Use this only for specific edge IPs you have measured; it does not scan broad Azure/GitHub ranges.
 
 Option `18) Toggle Low-Overhead Mode` reduces INFO-level app logging and slows less-essential background route/export refreshes while keeping heartbeat and self-heal checks alive. Use it when configs already work and you want less background noise during speed testing; turn it off when collecting diagnostics.
+
+Option `49) Toggle Latency Focus Mode` is more aggressive than low-overhead mode. It keeps heartbeat, session accounting, and self-heal alive, but suppresses non-error app logs and skips noncritical background route/export/message refreshes while the mode is active. Use it briefly while measuring client latency; turn it off before collecting support logs or expecting automatic export updates.
 
 The config screen writes three local export helpers: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `configs-meta.json`. They are ignored by git by default because they include live connection credentials or metadata. Use them locally, or distribute them through a private channel you control. A raw-GitHub subscription URL is shown only as a convenience for publicly reachable subscriptions or advanced users who provide a client-compatible private endpoint; a public repo makes the subscription public.
 

@@ -147,6 +147,7 @@ For automation that only needs GitHub state and wants to avoid an external route
 - `route_failure_reason`: machine-readable route reason such as `route_settling_404`, `timeout_or_unreachable`, `dns_tls_or_network_unreachable`, `edge_or_origin_error`, or `ready`.
 - `retry_after_seconds` / `poll_after_seconds`: how long the browser or automation should wait before checking again.
 - `next_action`: the fastest manual recovery step to try next.
+- `next_action_code`: stable machine-readable action code such as `retry_vless_config`, `wait_route_or_recover`, `rotate_github_token`, `wait_github_rate_limit`, or `wait_for_quota_reset`.
 - `quota_blocked: true`: GitHub returned HTTP `402`, so quota or billing is blocking the start.
 - `quota_reset_estimate_utc`: the next first-of-month UTC estimate for included-usage reset.
 - `retention_period_minutes` / `retention_expires_at`: GitHub Codespaces retention fields when the API returns them.
@@ -155,6 +156,7 @@ For automation that only needs GitHub state and wants to avoid an external route
 - `notification_status: "none"`: no Discord/Telegram alert was needed, or no alert channel is configured.
 - `notification_status: "deferred"` / `notifications_deferred: true`: Discord or Telegram delivery is running after the response through Cloudflare `waitUntil`; check Worker logs if an alert does not arrive.
 - `notification_status: "failed"`: notification delivery was attempted synchronously and `notification_errors` contains the delivery error.
+- `history_deferred: true`: KV history/quota incident writes were queued through Cloudflare `waitUntil`, so the dashboard response did not wait for storage writes.
 - `401`: Wrong wake secret, or GitHub rejected the stored token. Check the JSON `error`, `reason`, or `token_warning` field to tell which side rejected the request.
 - `402`: GitHub quota or billing blocked the start. Mark the Codespace as **Keep codespace**, wait for quota reset or adjust GitHub billing settings, then start the same Codespace again.
 - `403`: GitHub token was accepted but cannot access Codespaces, commonly because the `codespace` scope is missing. The response reason may be `github_token_scope_missing`.
