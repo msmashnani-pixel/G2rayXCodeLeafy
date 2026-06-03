@@ -116,6 +116,10 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_ROUTE_MONITOR_MAX_CANDIDATES` **(Optional)** — Caps cached candidate route probes shown in diagnostics. Default: `24`, hard-capped at `32`.
 - `G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES` **(Optional)** — Caps live fallback route probes in option `14) Diagnostics`. Default: `12`.
 - `G2RAY_ROUTE_HEALTH_TTL_SEC` **(Optional)** — Seconds cached route health can be reused to order exported configs before refreshing. Default: `300`.
+- `G2RAY_ROUTE_PROBE_CONCURRENCY` **(Optional)** — Maximum parallel route candidate probes during a route-health refresh. Default: `4`, hard-capped at `8`.
+- `G2RAY_ROUTE_FAILURE_COOLDOWN_SEC` **(Optional)** — Seconds to temporarily skip candidates that timed out or returned edge/origin errors. Default: `180`.
+- `G2RAY_PERFORMANCE_PROFILE` **(Optional)** — Config profile used when generating a new Xray config: `balanced` (default), `low_latency`, `streaming`, `unstable_mobile`, or `low_overhead`.
+- `G2RAY_LOW_OVERHEAD=1` **(Optional)** — Starts the panel in low-overhead mode, reducing INFO logs and less-essential background route/export refreshes. You can also toggle this from option `18`.
 - `G2RAY_PORT_PUBLIC_TTL_SEC` **(Optional)** — Seconds to trust the last successful `gh codespace ports visibility 443:public` call before calling GitHub again. Default: `300`.
 - `G2RAY_WAKER_TEST_TIMEOUT_SEC` **(Optional)** — Seconds the panel waits when testing the Cloudflare Worker from option `15) Recovery / Waker Setup`. Default: `180`.
 - `G2RAY_EDGE_RECONNECT_THRESHOLD` **(Optional)** — Number of consecutive unreachable edge checks before self-heal may run a full reconnect. Default: `3`.
@@ -129,7 +133,7 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 
 Generated links use `insecure=0&allowInsecure=0` by default so clients keep TLS certificate verification enabled. If a specific client cannot handle IP fallback links with SNI/Host routing, `allowInsecure=1` can be tried manually as a compatibility workaround, but that relaxes certificate verification and is not the default.
 
-By default the panel can export up to 20 usable IP fallback configs plus the domain config, ordered by rolling route health: success ratio, average successful XHTTP latency, and latest XHTTP latency. These numbers are `OPTIONS` probes against the Codespaces XHTTP route, not ICMP ping or full throughput tests. If GitHub/DNS exposes fewer healthy unique edge routes, the panel exports fewer rather than duplicating weak or unusable routes.
+By default the panel can export up to 20 usable IP fallback configs plus the domain config, ordered by rolling route health: success ratio, average successful XHTTP latency, recent weighted latency, latest XHTTP latency, and temporary cooldowns for candidates that timed out. These numbers are `OPTIONS` probes against the Codespaces XHTTP route, not ICMP ping or full throughput tests. If GitHub/DNS exposes fewer healthy unique edge routes, the panel exports fewer rather than duplicating weak or unusable routes.
 
 The panel saves high-resolution QR PNG files under `data/qr/` for the displayed configs. If a phone QR scanner struggles with the terminal QR preview, open the PNG in VS Code/browser, import the copy-ready link from the panel output, or use `configs-to-copy-for-mobile.txt`. Terminal zoom, font rendering, and dark themes can make dense QR codes harder to scan.
 
@@ -204,6 +208,7 @@ bash ./g2ray.sh --recover-now
 bash ./g2ray.sh --recover-now --json
 bash ./g2ray.sh --doctor-json
 bash ./g2ray.sh --support-bundle
+bash ./g2ray.sh --print-subscription-url
 ```
 
 `--recover-now` is non-interactive and soft-only: it verifies/starts Xray, reasserts public port visibility, waits for route readiness, refreshes route candidates, and refreshes exported configs. If the route is still settling, it can exit nonzero; open the interactive panel and use option `6) Recover Now` if you want the hard restart prompt.
@@ -212,19 +217,26 @@ bash ./g2ray.sh --support-bundle
 
 `--support-bundle` creates a redacted `.tar.gz` support bundle under `logs/`. It includes doctor JSON, diagnostics, structured event logs, route health, rolling route stats, route-settling history, and Xray logs while redacting VLESS links, UUIDs, bearer tokens, GitHub tokens, and wake secrets.
 
+`--print-subscription-url` prints the raw-GitHub URL where `configs-subscription-base64.txt` would be available if you publish that export yourself. Generated config exports are ignored by default because they contain live VLESS credentials; the base64 subscription is encoding, not encryption. Most VLESS clients cannot authenticate to a private GitHub raw URL, so a subscription URL is directly usable only when the file is publicly reachable or served through a client-compatible private endpoint. Prefer local/private distribution; if you intentionally publish a public subscription, rotate the UUID afterward when you want to revoke access, and do not publish `configs-to-copy-for-mobile.txt` or `configs-meta.json`.
+
 After `git pull`, reattach the panel or run:
 
 ```bash
 bash ./g2ray.sh --silent-start
+bash ./scripts/post-start.sh
 ```
 
-This starts or replaces the background supervisor with the pulled script version, verifies runtime readiness, and refreshes exports without stopping a healthy Xray process.
+`--silent-start` starts or replaces the background supervisor with the pulled script version, verifies runtime readiness, records `data/boot_status.json`, and refreshes exports without stopping a healthy Xray process. `scripts/post-start.sh` is what the devcontainer runs automatically; it wraps `--silent-start` and writes `logs/post-start.log` so a start from the Worker is easier to diagnose later.
 
 Persistent logs are written to `logs/g2ray.log`, `logs/g2ray-events.jsonl`, and `logs/g2ray-diagnostics.log`. Diagnostics records a readable snapshot there, so you can send those logs later and still preserve route waits, repairs, probe results, supervisor state, last-good route, route-settling history, and export refreshes from previous hours.
 
 Option `16) Live Monitor` is a foreground status screen for intentional terminal monitoring. It refreshes engine state, local/edge XHTTP probes, supervisor heartbeat, self-heal counters, route-settling history, best route candidates, and recent events without restarting Xray.
 
-Option `17) Route Candidates` opens the Route Candidates manager. It shows measured route IPs with last latency, rolling average latency, and success ratio; lets you add a manual IPv4 candidate, pin a preferred route, blacklist a bad route, unblacklist/remove entries, reset measured route health without wiping preferences, explicitly reset all route preferences, and refresh exports. Use this only for specific edge IPs you have measured; it does not scan broad Azure/GitHub ranges.
+Option `17) Route Candidates` opens the Route Candidates manager. It shows measured route IPs with last latency, average latency, recent weighted latency, success ratio, source, and failure reason; lets you add a manual IPv4 candidate, pin a preferred route, blacklist a bad route, unblacklist/remove entries, reset measured route health without wiping preferences, explicitly reset all route preferences, and refresh exports. Use this only for specific edge IPs you have measured; it does not scan broad Azure/GitHub ranges.
+
+Option `18) Toggle Low-Overhead Mode` reduces INFO-level app logging and slows less-essential background route/export refreshes while keeping heartbeat and self-heal checks alive. Use it when configs already work and you want less background noise during speed testing; turn it off when collecting diagnostics.
+
+The config screen writes three local export helpers: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `configs-meta.json`. They are ignored by git by default because they include live connection credentials or metadata. Use them locally, or distribute them through a private channel you control. A raw-GitHub subscription URL is shown only as a convenience for publicly reachable subscriptions or advanced users who provide a client-compatible private endpoint; a public repo makes the subscription public.
 
 On first setup, the panel shows a small recovery card so you can copy these recovery commands safely: `bash ./g2ray.sh --doctor-json`, `bash ./g2ray.sh --recover-now`, `bash ./g2ray.sh --recover-now --json`, `bash ./g2ray.sh --support-bundle`, and, when a Worker is configured, a curl template using `Authorization: Bearer <WAKE_SECRET>`. The raw wake secret is never printed from saved metadata.
 
@@ -262,8 +274,10 @@ Optional Cloudflare dashboard bindings:
 - `DISCORD_WEBHOOK_URL`: **Secret** variable for Discord alerts.
 - `TELEGRAM_BOT_TOKEN`: **Secret** variable for Telegram alerts.
 - `TELEGRAM_CHAT_ID`: **Secret** variable for Telegram alerts.
+- `WAKE_COOLDOWN_SECONDS`: **Plaintext** optional seconds to prevent repeated successful wake requests from spamming GitHub when KV is configured. Leave unset for no successful-wake cooldown. Any nonzero value below `60` is treated as `60` because Cloudflare KV expiration TTLs require at least 60 seconds.
+- `ROUTE_POLL_AFTER_SECONDS`: **Plaintext** optional browser/API retry hint while the route is settling. Default: `5`.
 
-With `WAKER_KV`, the Worker records quota-block incidents: first `HTTP 402`, latest `HTTP 402`, last successful wake/health check, and whether the same Codespace still appears accessible. With `QUOTA_SURVIVAL_CRON_ENABLED=true`, a Cloudflare Cron Trigger can check this state conservatively; it does not bypass quota and does not try repeated starts until the estimated monthly reset window.
+With `WAKER_KV`, the Worker records quota-block incidents: first `HTTP 402`, latest `HTTP 402`, last successful wake/health check, and whether the same Codespace still appears accessible. It can also enforce optional `WAKE_COOLDOWN_SECONDS` after a successful wake. With `QUOTA_SURVIVAL_CRON_ENABLED=true`, a Cloudflare Cron Trigger can check this state conservatively; it does not bypass quota and does not try repeated starts until the estimated monthly reset window.
 
 The Worker URL can be entered with or without `https://`, and with or without `/wake`; the panel normalizes it to `https://YOUR_WORKER.workers.dev/wake`.
 
@@ -341,7 +355,7 @@ G2rayXCodeLeafy/
 Ensure you have activated Option `7` in the G2ray panel (Toggle Anti-Sleep Mode) to spawn a background Tmux session that simulates activity while the Codespace is running. This is best-effort: GitHub may still stop the Codespace when quota, budget, idle-timeout policy, or retention/deletion rules apply.
 
 **Will it restart after my monthly quota resets?**
-Not by itself while GitHub is blocking or stopping the Codespace, because no code runs inside a stopped Codespace. The Worker can show `HTTP 402`, estimate the next monthly reset, and, if you enabled optional KV/Cron, check conservatively near reset. The same configs work next month only if the same Codespace survives, so mark it as **Keep codespace** before quota runs out. After the monthly included usage resets, reopen it from GitHub or the Worker; `postStartCommand` runs `g2ray.sh --silent-start`, starts Xray, starts the supervisor, and refreshes exported configs.
+Not by itself while GitHub is blocking or stopping the Codespace, because no code runs inside a stopped Codespace. The Worker can show `HTTP 402`, estimate the next monthly reset, and, if you enabled optional KV/Cron, check conservatively near reset. The same configs work next month only if the same Codespace survives, so mark it as **Keep codespace** before quota runs out. After the monthly included usage resets, reopen it from GitHub or the Worker; `postStartCommand` runs `scripts/post-start.sh`, which calls `g2ray.sh --silent-start`, starts Xray, starts the supervisor, records boot status, and refreshes exported configs.
 
 **Is the 15 GB limit my VPN data limit?**
 No. GitHub's 15 GB-month included allowance is Codespaces storage. The panel's RX/TX traffic counter measures tunnel traffic for your visibility, but it is not the same as the GitHub storage quota.

@@ -28,6 +28,10 @@ EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
 EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
 ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
 ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
+ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
+BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
+LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
+LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
 LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
 PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
 MANUAL_ROUTE_CANDIDATES_FILE="$DATA_DIR/manual_route_candidates.txt"
@@ -47,6 +51,7 @@ DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
 QR_DIR="$DATA_DIR/qr"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
+CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT="${XRAY_PORT:-443}"
 [[ "$XRAY_PORT" =~ ^[0-9]+$ && "$XRAY_PORT" -gt 0 && "$XRAY_PORT" -le 65535 ]] || XRAY_PORT=443
@@ -62,15 +67,21 @@ FORCE_RECONNECT_ROUTE_WAIT_SEC="${G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC:-60}"
 ROUTE_READY_STABLE_PROBES="${G2RAY_ROUTE_READY_STABLE_PROBES:-2}"
 ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
+ROUTE_FAILURE_COOLDOWN_SEC="${G2RAY_ROUTE_FAILURE_COOLDOWN_SEC:-180}"
+ROUTE_PROBE_CONCURRENCY="${G2RAY_ROUTE_PROBE_CONCURRENCY:-4}"
+ROUTE_PROBE_JITTER_SEC="${G2RAY_ROUTE_PROBE_JITTER_SEC:-0}"
 PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
 WAKER_TEST_TIMEOUT_SEC="${G2RAY_WAKER_TEST_TIMEOUT_SEC:-180}"
 RUNTIME_LOCK_WAIT_ATTEMPTS="${G2RAY_RUNTIME_LOCK_WAIT_ATTEMPTS:-900}"
+PERFORMANCE_PROFILE="${G2RAY_PERFORMANCE_PROFILE:-balanced}"
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$WAKER_TEST_TIMEOUT_SEC" =~ ^[0-9]+$ && "$WAKER_TEST_TIMEOUT_SEC" -ge 30 ]] || WAKER_TEST_TIMEOUT_SEC=180
 [[ "$RUNTIME_LOCK_WAIT_ATTEMPTS" =~ ^[0-9]+$ && "$RUNTIME_LOCK_WAIT_ATTEMPTS" -ge 1 ]] || RUNTIME_LOCK_WAIT_ATTEMPTS=900
 [[ "$ROUTE_READY_STABLE_PROBES" =~ ^[0-9]+$ && "$ROUTE_READY_STABLE_PROBES" -ge 1 ]] || ROUTE_READY_STABLE_PROBES=2
 [[ "$ROUTE_READY_STABLE_SLEEP_SEC" =~ ^[0-9]+$ ]] || ROUTE_READY_STABLE_SLEEP_SEC=1
+[[ "$ROUTE_PROBE_CONCURRENCY" =~ ^[0-9]+$ && "$ROUTE_PROBE_CONCURRENCY" -ge 1 ]] || ROUTE_PROBE_CONCURRENCY=4
+(( ROUTE_PROBE_CONCURRENCY > 8 )) && ROUTE_PROBE_CONCURRENCY=8
 
 umask 077
 mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
@@ -90,6 +101,41 @@ json_escape() {
         | tr -d '\r\n'
 }
 
+low_overhead_enabled() {
+    [[ -s "$LOW_OVERHEAD_DISABLED_FILE" ]] && return 1
+    [[ -s "$LOW_OVERHEAD_FILE" ]] && return 0
+    [[ "${G2RAY_LOW_OVERHEAD:-0}" == "1" ]]
+}
+
+enable_low_overhead_mode() {
+    rm -f "$LOW_OVERHEAD_DISABLED_FILE" 2>/dev/null || true
+    printf 'enabled\n' > "$LOW_OVERHEAD_FILE"
+    chmod 600 "$LOW_OVERHEAD_FILE" 2>/dev/null || true
+}
+
+disable_low_overhead_mode() {
+    rm -f "$LOW_OVERHEAD_FILE" 2>/dev/null || true
+    printf 'disabled\n' > "$LOW_OVERHEAD_DISABLED_FILE"
+    chmod 600 "$LOW_OVERHEAD_DISABLED_FILE" 2>/dev/null || true
+}
+
+toggle_low_overhead_mode() {
+    if low_overhead_enabled; then
+        disable_low_overhead_mode
+        return 1
+    fi
+    enable_low_overhead_mode
+    return 0
+}
+
+low_overhead_summary() {
+    if low_overhead_enabled; then
+        printf 'Enabled - background route refresh and INFO log chatter are reduced\n'
+    else
+        printf 'Disabled - full monitoring and INFO logs are enabled\n'
+    fi
+}
+
 log_structured_event() {
     local ts="$1" level="$2" msg="$3" event
     event=$(printf '%s' "$msg" | awk '{print $1; exit}' | tr -cd 'A-Za-z0-9_.:-')
@@ -103,11 +149,56 @@ log_structured_event() {
 log_event() {
     local level="$1"; shift || true
     local ts msg
+    if low_overhead_enabled && [[ "$level" == "INFO" ]]; then
+        return 0
+    fi
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
     msg="$*"
     rotate_log_file "$LOG_FILE"
     printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
     log_structured_event "$ts" "$level" "$msg"
+}
+
+write_boot_status() {
+    local status="${1:-unknown}" reason="${2:-unknown}" message="${3:-}" code="${4:-0}" ms="${5:-0}" ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+    mkdir -p "$DATA_DIR" 2>/dev/null || true
+    cat > "$BOOT_STATUS_FILE" <<JSON
+{
+  "ts": "$(json_escape "$ts")",
+  "status": "$(json_escape "$status")",
+  "reason": "$(json_escape "$reason")",
+  "message": "$(json_escape "$message")",
+  "route_http_status": ${code:-0},
+  "route_latency_ms": ${ms:-0}
+}
+JSON
+    chmod 600 "$BOOT_STATUS_FILE" 2>/dev/null || true
+    log_event INFO "boot_status status=${status} reason=${reason} route_http=${code:-0} route_ms=${ms:-0}"
+}
+
+boot_status_summary() {
+    if [[ ! -s "$BOOT_STATUS_FILE" ]]; then
+        printf 'Boot status : none recorded\n'
+        return 0
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '"Boot status : \(.status) reason=\(.reason) route=HTTP \(.route_http_status) \(.route_latency_ms)ms at \(.ts)\nMessage     : \(.message)"' "$BOOT_STATUS_FILE" 2>/dev/null && return 0
+    fi
+    awk -F '"' '
+        /"ts"/ {ts=$4}
+        /"status"/ {status=$4}
+        /"reason"/ {reason=$4}
+        /"message"/ {message=$4}
+        /"route_http_status"/ {gsub(/[^0-9]/, "", $0); code=$0}
+        /"route_latency_ms"/ {gsub(/[^0-9]/, "", $0); ms=$0}
+        END {
+            printf "Boot status : %s reason=%s route=HTTP %s %sms at %s\n",
+                (status ? status : "unknown"), (reason ? reason : "unknown"),
+                (code ? code : "0"), (ms ? ms : "0"), (ts ? ts : "unknown")
+            if (message) printf "Message     : %s\n", message
+        }
+    ' "$BOOT_STATUS_FILE" 2>/dev/null
 }
 
 rotate_log_file() {
@@ -243,7 +334,7 @@ xhttp_config_path() {
 }
 
 xhttp_probe_metrics() {
-    local target="${1:-external}" address="${2:-}" path url raw code elapsed ms
+    local target="${1:-external}" address="${2:-}" path url raw code elapsed ms curl_rc=0 error_hint="" reason
     path=$(xhttp_config_path)
     [[ "$path" == /* ]] || path="/${path}"
     case "$target" in
@@ -251,10 +342,16 @@ xhttp_probe_metrics() {
         *)     url="https://${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}${path}" ;;
     esac
     if [[ "$target" == "local" || -z "$address" ]]; then
-        raw=$(curl -sk -m 5 -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || raw="0 0"
+        raw=$(curl -sk -m 5 -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || {
+            curl_rc=$?
+            raw="0 0"
+        }
     else
         raw=$(curl -sk -m 5 --resolve "${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}:${address}" \
-            -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || raw="0 0"
+            -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || {
+            curl_rc=$?
+            raw="0 0"
+        }
     fi
     code=${raw%% *}
     elapsed=${raw#* }
@@ -262,7 +359,17 @@ xhttp_probe_metrics() {
     [[ "$code" == "000" ]] && code=0
     [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] || elapsed=0
     ms=$(awk -v s="${elapsed:-0}" 'BEGIN{printf "%d", (s * 1000) + 0.5}')
-    printf '%s %s\n' "${code:-0}" "${ms:-0}"
+    if [[ "$code" == "0" ]]; then
+        case "$curl_rc" in
+            28) error_hint="timeout" ;;
+            6)  error_hint="dns" ;;
+            7|52|56) error_hint="network" ;;
+            35|51|58|60) error_hint="tls" ;;
+            *)  error_hint="curl_${curl_rc}" ;;
+        esac
+    fi
+    reason=$(route_failure_reason_for_status "$code" "$error_hint")
+    printf '%s %s %s\n' "${code:-0}" "${ms:-0}" "$reason"
 }
 
 xhttp_probe_status() {
@@ -444,6 +551,7 @@ add_manual_route_candidate() {
     valid_ipv4 "$ip" || return 1
     candidate_blacklisted "$ip" && return 1
     append_unique_route "$MANUAL_ROUTE_CANDIDATES_FILE" "$ip" || return 1
+    clear_route_candidate_cooldown "$ip"
     log_event INFO "route_candidate manual_added ip=${ip}"
     return 0
 }
@@ -470,6 +578,7 @@ pin_route_candidate() {
     candidate_blacklisted "$ip" && return 1
     _atomic_write "$PINNED_ROUTE_FILE" "$ip" || return 1
     chmod 600 "$PINNED_ROUTE_FILE" 2>/dev/null || true
+    clear_route_candidate_cooldown "$ip"
     log_event INFO "route_candidate pinned ip=${ip}"
     return 0
 }
@@ -499,6 +608,7 @@ unblacklist_route_candidate() {
     local ip="${1:-}"
     valid_ipv4 "$ip" || return 1
     remove_route_from_file "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$ip" || return 1
+    clear_route_candidate_cooldown "$ip"
     log_event INFO "route_candidate unblacklisted ip=${ip}"
     return 0
 }
@@ -510,7 +620,7 @@ reset_route_candidate_state() {
 }
 
 reset_route_candidate_cache() {
-    rm -f "$ROUTE_HEALTH_FILE" "$ROUTE_STATS_FILE" "$LAST_GOOD_ROUTE_FILE" 2>/dev/null || true
+    rm -f "$ROUTE_HEALTH_FILE" "$ROUTE_STATS_FILE" "$LAST_GOOD_ROUTE_FILE" "$ROUTE_COOLDOWN_FILE" 2>/dev/null || true
     log_event INFO "route_candidate cache_reset"
 }
 
@@ -532,28 +642,34 @@ route_candidate_state_summary() {
     fi
 }
 
-resolve_domain_ips() {
-    local domain="$1" candidates joined
+resolve_domain_ips_with_sources() {
+    local domain="$1" candidates
     candidates=$({
-        pinned_route_value
-        manual_route_candidates
-        cached_route_candidate_ips
+        pinned_route_value | awk 'NF {print "pinned\t" $0}'
+        manual_route_candidates | awk 'NF {print "manual\t" $0}'
+        cached_route_candidate_ips | awk 'NF {print "cache\t" $0}'
         if [[ -n "${G2RAY_EXTRA_FALLBACK_IPS:-}" ]]; then
-            printf '%s\n' "$G2RAY_EXTRA_FALLBACK_IPS" | tr ',; ' '\n'
+            printf '%s\n' "$G2RAY_EXTRA_FALLBACK_IPS" | tr ',; ' '\n' | awk 'NF {print "extra\t" $0}'
         fi
         if command -v dig >/dev/null 2>&1; then
-            dig +short "$domain" A 2>/dev/null || true
+            dig +short "$domain" A 2>/dev/null | awk 'NF {print "dig\t" $0}' || true
         fi
-        getent hosts "$domain" 2>/dev/null | awk '{print $1}' || true
-        json_dns_ips "https://dns.google/resolve?name=${domain}&type=A"
-        json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json"
-        curl_remote_ip "$domain" || true
-        printf '%s\n' "$DEFAULT_FALLBACK_IPS" | tr ',; ' '\n'
-    } | while IFS= read -r ip; do
+        getent hosts "$domain" 2>/dev/null | awk '{print "getent\t" $1}' || true
+        { json_dns_ips "https://dns.google/resolve?name=${domain}&type=A" || true; } | awk 'NF {print "dns_google\t" $0}'
+        { json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json" || true; } | awk 'NF {print "dns_cloudflare\t" $0}'
+        { curl_remote_ip "$domain" || true; } | awk 'NF {print "remote_http\t" $0}'
+        printf '%s\n' "$DEFAULT_FALLBACK_IPS" | tr ',; ' '\n' | awk 'NF {print "builtin\t" $0}'
+    } | while IFS=$'\t' read -r source ip; do
         valid_ipv4 "$ip" || continue
         candidate_blacklisted "$ip" && continue
-        printf '%s\n' "$ip"
-    done | awk '!seen[$0]++ {print}')
+        printf '%s\t%s\n' "${source:-unknown}" "$ip"
+    done | awk -F '\t' '!seen[$2]++ {print}')
+    printf '%s\n' "$candidates"
+}
+
+resolve_domain_ips() {
+    local domain="$1" candidates joined
+    candidates=$(resolve_domain_ips_with_sources "$domain" | awk -F '\t' '{print $2}')
     if [[ -n "$candidates" ]]; then
         joined=$(printf '%s' "$candidates" | tr '\n' ',' | sed 's/,$//')
         log_event INFO "resolver domain=${domain} fallback_candidates=${joined}"
@@ -1574,9 +1690,14 @@ _background_tasks() {
         save_xray_stats    >/dev/null 2>&1 || true
         save_session_uptime >/dev/null 2>&1 || true
         (( ++health_tick >= 5 )) && { health_probe >/dev/null 2>&1; health_tick=0; }
-        (( ++route_tick >= 5 )) && { refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
-        (( ++export_tick >= 5 )) && { refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
-        (( ++tick >= 3 )) && { fetch_remote_message; tick=0; }
+        if low_overhead_enabled; then
+            (( ++route_tick >= 15 )) && { refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
+            (( ++export_tick >= 15 )) && { refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
+        else
+            (( ++route_tick >= 5 )) && { refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
+            (( ++export_tick >= 5 )) && { refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
+            (( ++tick >= 3 )) && { fetch_remote_message; tick=0; }
+        fi
     done
 }
 
@@ -1884,19 +2005,67 @@ check_port_visibility() {
     fi
 }
 
+performance_profile_settings() {
+    local profile="${1:-$PERFORMANCE_PROFILE}"
+    case "$profile" in
+        low_latency|latency)
+            printf 'name=low_latency\nmaxUploadSize=3000000\nmaxConcurrentUploads=24\nhandshake=3\nconnIdle=600\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
+            ;;
+        streaming|video)
+            printf 'name=streaming\nmaxUploadSize=4000000\nmaxConcurrentUploads=20\nhandshake=4\nconnIdle=900\nuplinkOnly=1\ndownlinkOnly=4\nbufferSize=768\nsniffQuic=true\nloglevel=warning\n'
+            ;;
+        unstable_mobile|mobile)
+            printf 'name=unstable_mobile\nmaxUploadSize=1500000\nmaxConcurrentUploads=12\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=4\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            ;;
+        low_overhead|minimal)
+            printf 'name=low_overhead\nmaxUploadSize=1000000\nmaxConcurrentUploads=8\nhandshake=3\nconnIdle=420\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
+            ;;
+        *)
+            printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=600\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
+            ;;
+    esac
+}
+
 generate_config() {
     uuidgen > "$UUID_FILE"
     local uuid; uuid=$(cat "$UUID_FILE")
+    local profile_name max_upload_size max_concurrent_uploads handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value
+    while IFS='=' read -r key value; do
+        case "$key" in
+            name) profile_name="$value" ;;
+            maxUploadSize) max_upload_size="$value" ;;
+            maxConcurrentUploads) max_concurrent_uploads="$value" ;;
+            handshake) handshake="$value" ;;
+            connIdle) conn_idle="$value" ;;
+            uplinkOnly) uplink_only="$value" ;;
+            downlinkOnly) downlink_only="$value" ;;
+            bufferSize) buffer_size="$value" ;;
+            sniffQuic) sniff_quic="$value" ;;
+            loglevel) loglevel="$value" ;;
+        esac
+    done < <(performance_profile_settings "$PERFORMANCE_PROFILE")
+    profile_name="${profile_name:-balanced}"
+    max_upload_size="${max_upload_size:-2000000}"
+    max_concurrent_uploads="${max_concurrent_uploads:-16}"
+    handshake="${handshake:-3}"
+    conn_idle="${conn_idle:-600}"
+    uplink_only="${uplink_only:-1}"
+    downlink_only="${downlink_only:-2}"
+    buffer_size="${buffer_size:-512}"
+    sniff_quic="${sniff_quic:-true}"
+    loglevel="${loglevel:-warning}"
+    sniff_dest='["http", "tls"]'
+    [[ "$sniff_quic" == "true" ]] && sniff_dest='["http", "tls", "quic"]'
     local uuid_hash; uuid_hash=$(fingerprint_secret "$uuid")
-    log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN}"
+    log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name}"
     cat > "$CONFIG_FILE" << JSONEOF
 {
-  "log": { "loglevel": "warning", "access": "none", "error": "${LOG_DIR}/xray-error.log" },
+  "log": { "loglevel": "${loglevel}", "access": "none", "error": "${LOG_DIR}/xray-error.log" },
   "stats": {},
   "api": { "tag": "api", "services": ["StatsService"] },
   "policy": {
     "system": { "statsInboundDownlink": true, "statsInboundUplink": true },
-    "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true, "handshake": 3, "connIdle": 600, "uplinkOnly": 1, "downlinkOnly": 2, "bufferSize": 512 } }
+    "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true, "handshake": ${handshake}, "connIdle": ${conn_idle}, "uplinkOnly": ${uplink_only}, "downlinkOnly": ${downlink_only}, "bufferSize": ${buffer_size} } }
   },
   "dns": {
     "hosts": {
@@ -1924,9 +2093,9 @@ generate_config() {
       },
       "streamSettings": {
         "network": "xhttp", "security": "none",
-        "xhttpSettings": { "mode": "packet-up", "path": "/", "maxUploadSize": 2000000, "maxConcurrentUploads": 16 }
+        "xhttpSettings": { "mode": "packet-up", "path": "/", "maxUploadSize": ${max_upload_size}, "maxConcurrentUploads": ${max_concurrent_uploads} }
       },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": false }
+      "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
     },
     { "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "tag": "api" }
   ],
@@ -1981,23 +2150,99 @@ route_monitor_max_candidates() {
     printf '%s' "$max"
 }
 
+route_failure_reason_for_status() {
+    local code="${1:-0}" error="${2:-}" lowered
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code=0
+    lowered=$(printf '%s' "$error" | tr '[:upper:]' '[:lower:]')
+    if xhttp_status_usable "$code"; then
+        printf 'ready'
+    elif [[ "$code" == "404" ]]; then
+        printf 'route_settling_404'
+    elif [[ "$code" == "0" ]]; then
+        if [[ "$lowered" == *"timed"* || "$lowered" == *"timeout"* || "$lowered" == *"network"* || "$lowered" == *"connect"* ]]; then
+            printf 'timeout_or_unreachable'
+        else
+            printf 'dns_tls_or_network_unreachable'
+        fi
+    elif (( code >= 500 )); then
+        printf 'edge_or_origin_error'
+    elif (( code == 401 || code == 403 )); then
+        printf 'auth_or_visibility_blocked'
+    else
+        printf 'unexpected_http_status'
+    fi
+}
+
+route_candidate_cooldown_active() {
+    local ip="$1" now until reason
+    [[ -s "$ROUTE_COOLDOWN_FILE" ]] || return 1
+    now=$(date +%s)
+    while IFS=$'\t' read -r until _ip reason; do
+        [[ "$_ip" == "$ip" && "$until" =~ ^[0-9]+$ ]] || continue
+        if (( now < until )); then
+            return 0
+        fi
+    done < "$ROUTE_COOLDOWN_FILE"
+    return 1
+}
+
+route_candidate_cooldown_bypass() {
+    local ip="$1" source="${2:-}"
+    [[ "$source" == "pinned" || "$source" == "manual" ]] && return 0
+    [[ "$(pinned_route_value)" == "$ip" ]] && return 0
+    route_file_contains "$MANUAL_ROUTE_CANDIDATES_FILE" "$ip" && return 0
+    return 1
+}
+
+record_route_candidate_cooldown() {
+    local ip="$1" reason="${2:-unknown}" now until ttl tmp
+    valid_ipv4 "$ip" || return 0
+    ttl="$ROUTE_FAILURE_COOLDOWN_SEC"
+    [[ "$ttl" =~ ^[0-9]+$ && "$ttl" -gt 0 ]] || ttl=180
+    now=$(date +%s)
+    until=$((now + ttl))
+    tmp=$(mktemp "$DATA_DIR/route_cooldown.XXXXXX") || return 0
+    awk -F '\t' -v OFS='\t' -v now="$now" -v target="$ip" '$1 ~ /^[0-9]+$/ && $1 > now && $2 != target {print}' "$ROUTE_COOLDOWN_FILE" 2>/dev/null > "$tmp" || true
+    printf '%s\t%s\t%s\n' "$until" "$ip" "$reason" >> "$tmp"
+    mv "$tmp" "$ROUTE_COOLDOWN_FILE" 2>/dev/null || rm -f "$tmp"
+    chmod 600 "$ROUTE_COOLDOWN_FILE" 2>/dev/null || true
+}
+
+clear_route_candidate_cooldown() {
+    local ip="$1" now tmp
+    valid_ipv4 "$ip" || return 0
+    [[ -s "$ROUTE_COOLDOWN_FILE" ]] || return 0
+    now=$(date +%s)
+    tmp=$(mktemp "$DATA_DIR/route_cooldown.XXXXXX") || return 0
+    awk -F '\t' -v OFS='\t' -v now="$now" -v target="$ip" \
+        '$1 ~ /^[0-9]+$/ && $1 > now && $2 != target {print}' "$ROUTE_COOLDOWN_FILE" 2>/dev/null > "$tmp" || true
+    if [[ -s "$tmp" ]]; then
+        mv "$tmp" "$ROUTE_COOLDOWN_FILE" 2>/dev/null || rm -f "$tmp"
+        chmod 600 "$ROUTE_COOLDOWN_FILE" 2>/dev/null || true
+    else
+        rm -f "$tmp" "$ROUTE_COOLDOWN_FILE" 2>/dev/null || true
+    fi
+}
+
 update_route_candidate_stats() {
-    local ip="$1" code="${2:-0}" ms="${3:-0}" usable=false checked tmp
+    local ip="$1" code="${2:-0}" ms="${3:-0}" source="${4:-probe}" reason="${5:-}" usable=false checked tmp
     valid_ipv4 "$ip" || return 0
     [[ "$code" =~ ^[0-9]{3}$ ]] || code=0
     [[ "$ms" =~ ^[0-9]+$ ]] || ms=0
+    [[ -n "$reason" ]] || reason=$(route_failure_reason_for_status "$code")
     xhttp_status_usable "$code" && usable=true
     checked=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
     mkdir -p "$DATA_DIR" 2>/dev/null || true
     [[ -f "$ROUTE_STATS_FILE" ]] || : > "$ROUTE_STATS_FILE"
     tmp=$(mktemp "$DATA_DIR/route_stats.XXXXXX") || return 1
     awk -F '\t' -v OFS='\t' \
-        -v target="$ip" -v code="$code" -v ms="$ms" -v usable="$usable" -v checked="$checked" '
-        function emit(ip, samples, successes, failures, avg, min, max, last_ms, last_code, last_usable, last_checked) {
+        -v target="$ip" -v code="$code" -v ms="$ms" -v usable="$usable" -v checked="$checked" -v source="$source" -v reason="$reason" '
+        function emit(ip, samples, successes, failures, avg, min, max, last_ms, last_code, last_usable, last_checked, ewma, recent_failures, last_reason) {
             if (samples < 1) samples = 1
-            printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
+            printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%s\n",
                 ip, samples, successes, failures, avg, min, max,
-                last_ms, last_code, last_usable, last_checked
+                last_ms, last_code, last_usable, last_checked,
+                ewma, recent_failures, last_reason
         }
         $1 == target {
             found = 1
@@ -2007,15 +2252,22 @@ update_route_candidate_stats() {
             avg = ($5 ~ /^[0-9]+$/) ? $5 + 0 : 0
             min = ($6 ~ /^[0-9]+$/) ? $6 + 0 : 0
             max = ($7 ~ /^[0-9]+$/) ? $7 + 0 : 0
+            ewma = ($12 ~ /^[0-9]+$/) ? $12 + 0 : avg
+            recent_failures = ($13 ~ /^[0-9]+$/) ? $13 + 0 : 0
             if (usable == "true") {
                 successes += 1
                 avg = (successes == 1) ? ms : int((((avg * (successes - 1)) + ms) / successes) + 0.5)
                 min = (min == 0 || ms < min) ? ms : min
                 max = (ms > max) ? ms : max
+                ewma = (ewma == 0) ? ms : int(((ewma * 7 + ms * 3) / 10) + 0.5)
+                recent_failures = int((recent_failures * 7) / 10)
             } else {
                 failures += 1
+                penalty_ms = (ms > 0) ? ms : 9999
+                ewma = (ewma == 0) ? penalty_ms : int(((ewma * 7 + penalty_ms * 3) / 10) + 0.5)
+                recent_failures += 1
             }
-            emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked)
+            emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked, ewma, recent_failures, reason)
             next
         }
         NF >= 1 { print }
@@ -2027,7 +2279,9 @@ update_route_candidate_stats() {
                 avg = (usable == "true") ? ms : 0
                 min = (usable == "true") ? ms : 0
                 max = (usable == "true") ? ms : 0
-                emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked)
+                ewma = (usable == "true") ? ms : ((ms > 0) ? ms : 9999)
+                recent_failures = (usable == "true") ? 0 : 1
+                emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked, ewma, recent_failures, reason)
             }
         }
     ' "$ROUTE_STATS_FILE" 2>/dev/null > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -2036,12 +2290,16 @@ update_route_candidate_stats() {
 }
 
 record_route_candidate_health() {
-    local ip="$1" code="$2" ms="$3" usable=false checked
+    local ip="$1" code="$2" ms="$3" source="${4:-probe}" reason="${5:-}" usable=false checked
     checked=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
+    [[ -n "$reason" ]] || reason=$(route_failure_reason_for_status "$code")
     xhttp_status_usable "$code" && usable=true
-    printf '%s\t%s\t%s\t%s\t%s\n' \
-        "$checked" "$ip" "${code:-0}" "${ms:-0}" "$usable" >> "${route_health_tmp:-$ROUTE_HEALTH_FILE}"
-    update_route_candidate_stats "$ip" "$code" "$ms" || true
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$checked" "$ip" "${code:-0}" "${ms:-0}" "$usable" "$source" "$reason" >> "${route_health_tmp:-$ROUTE_HEALTH_FILE}"
+    update_route_candidate_stats "$ip" "$code" "$ms" "$source" "$reason" || true
+    if [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" ]]; then
+        record_route_candidate_cooldown "$ip" "$reason"
+    fi
 }
 
 save_last_good_route() {
@@ -2080,25 +2338,76 @@ last_good_route_summary() {
     ' "$LAST_GOOD_ROUTE_FILE" 2>/dev/null
 }
 
+route_probe_jitter_sleep() {
+    local delay="${ROUTE_PROBE_JITTER_SEC:-0}"
+    [[ "$delay" == "0" || "$delay" == "0.0" ]] && return 0
+    sleep "$delay" 2>/dev/null || true
+}
+
+probe_route_candidate_worker() {
+    local ip="$1" source="$2" outfile="$3" code ms reason
+    route_probe_jitter_sleep
+    read -r code ms reason < <(xhttp_probe_metrics external "$ip")
+    [[ -n "$reason" ]] || reason=$(route_failure_reason_for_status "$code")
+    printf '%s\t%s\t%s\t%s\t%s\n' "$ip" "${source:-probe}" "${code:-0}" "${ms:-0}" "$reason" > "$outfile"
+}
+
 refresh_route_candidate_health() {
     [[ -f "$CONFIG_FILE" ]] || return 0
-    local candidates ip ip_probe ip_ms count=0 max route_health_tmp best_ip="" best_code=0 best_ms=99999999
+    local candidates source ip ip_probe ip_ms reason count=0 max route_health_tmp best_ip="" best_code=0 best_ms=99999999
+    local concurrency pids=() files=() active=0 file result probed_count=0
     max=$(route_monitor_max_candidates)
-    candidates=$(resolve_domain_ips "$PORT_DOMAIN" || true)
+    concurrency="$ROUTE_PROBE_CONCURRENCY"
+    [[ "$concurrency" =~ ^[0-9]+$ && "$concurrency" -gt 0 ]] || concurrency=4
+    (( concurrency > 8 )) && concurrency=8
+    candidates=$(resolve_domain_ips_with_sources "$PORT_DOMAIN" || true)
     [[ -n "$candidates" ]] || return 0
     route_health_tmp=$(mktemp "$DATA_DIR/route_health.XXXXXX") || return 1
-    while IFS= read -r ip; do
+
+    collect_route_probe_batch() {
+        local idx f row _ip _source _code _ms _reason
+        for idx in "${!pids[@]}"; do
+            wait "${pids[$idx]}" 2>/dev/null || true
+            f="${files[$idx]}"
+            [[ -s "$f" ]] || { rm -f "$f"; continue; }
+            row=$(cat "$f" 2>/dev/null || true)
+            rm -f "$f" 2>/dev/null || true
+            IFS=$'\t' read -r _ip _source _code _ms _reason <<< "$row"
+            valid_ipv4 "$_ip" || continue
+            probed_count=$((probed_count + 1))
+            record_route_candidate_health "$_ip" "$_code" "$_ms" "$_source" "$_reason"
+            if xhttp_status_usable "$_code" && [[ "$_ms" =~ ^[0-9]+$ ]] && (( _ms < best_ms )); then
+                best_ip="$_ip"
+                best_code="$_code"
+                best_ms="$_ms"
+            fi
+        done
+        pids=()
+        files=()
+        active=0
+    }
+
+    while IFS=$'\t' read -r source ip; do
         [[ -n "$ip" ]] || continue
-        read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
-        record_route_candidate_health "$ip" "$ip_probe" "$ip_ms"
-        if xhttp_status_usable "$ip_probe" && [[ "$ip_ms" =~ ^[0-9]+$ ]] && (( ip_ms < best_ms )); then
-            best_ip="$ip"
-            best_code="$ip_probe"
-            best_ms="$ip_ms"
-        fi
+        candidate_blacklisted "$ip" && continue
+        route_candidate_cooldown_active "$ip" && ! route_candidate_cooldown_bypass "$ip" "$source" && continue
+        file=$(mktemp "$DATA_DIR/route_probe.XXXXXX") || continue
+        probe_route_candidate_worker "$ip" "$source" "$file" &
+        pids+=("$!")
+        files+=("$file")
+        active=$((active + 1))
         count=$((count + 1))
+        if (( active >= concurrency )); then
+            collect_route_probe_batch
+        fi
         (( count >= max )) && break
     done <<< "$candidates"
+    (( active > 0 )) && collect_route_probe_batch
+    if (( probed_count == 0 )); then
+        rm -f "$route_health_tmp" 2>/dev/null || true
+        log_event WARN "route_candidate_monitor skipped_all_candidates count=${count} max=${max}"
+        return 0
+    fi
     mv "$route_health_tmp" "$ROUTE_HEALTH_FILE"
     chmod 600 "$ROUTE_HEALTH_FILE" 2>/dev/null || true
     [[ -n "$best_ip" ]] && save_last_good_route "$best_ip" "$best_code" "$best_ms" "route_candidate_monitor"
@@ -2127,6 +2436,8 @@ cached_usable_fallback_ips() {
                 successes[$1] = ($3 ~ /^[0-9]+$/) ? $3 + 0 : 0
                 avg[$1] = ($5 ~ /^[0-9]+$/) ? $5 + 0 : 0
                 latest[$1] = ($8 ~ /^[0-9]+$/) ? $8 + 0 : 0
+                ewma[$1] = ($12 ~ /^[0-9]+$/) ? $12 + 0 : avg[$1]
+                recent_failures[$1] = ($13 ~ /^[0-9]+$/) ? $13 + 0 : 0
             }
             next
         }
@@ -2135,13 +2446,15 @@ cached_usable_fallback_ips() {
             latency = ($4 ~ /^[0-9]+$/) ? $4 + 0 : 99999999
             total = ((ip in samples) && samples[ip] > 0) ? samples[ip] : 1
             ok = (ip in successes) ? successes[ip] : 1
-            success_penalty = int(((total - ok) * 1000) / total)
+            recent = (ip in recent_failures) ? recent_failures[ip] : 0
+            success_penalty = int(((total - ok) * 1000) / total) + (recent * 75)
             avg_ms = ((ip in avg) && avg[ip] > 0) ? avg[ip] : latency
+            score_ms = ((ip in ewma) && ewma[ip] > 0) ? ewma[ip] : avg_ms
             last_ms = ((ip in latest) && latest[ip] > 0) ? latest[ip] : latency
             pinned_rank = (ip == pinned) ? 0 : 1
             last_good_rank = (ip == last_good) ? 0 : 1
             printf "%d\t%04d\t%08d\t%08d\t%d\t%s\t%s\t%s\n",
-                pinned_rank, success_penalty, avg_ms, last_ms, last_good_rank, ip, $3, $4
+                pinned_rank, success_penalty, score_ms, last_ms, last_good_rank, ip, $3, $4
         }
     ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n \
         | while IFS=$'\t' read -r _pinned _success _avg _latest _last_good ip _code _ms; do
@@ -2174,6 +2487,9 @@ route_candidate_health_summary() {
                 successes[$1] = ($3 ~ /^[0-9]+$/) ? $3 + 0 : 0
                 avg[$1] = ($5 ~ /^[0-9]+$/) ? $5 + 0 : 0
                 latest[$1] = ($8 ~ /^[0-9]+$/) ? $8 + 0 : 0
+                ewma[$1] = ($12 ~ /^[0-9]+$/) ? $12 + 0 : avg[$1]
+                recent_failures[$1] = ($13 ~ /^[0-9]+$/) ? $13 + 0 : 0
+                last_reason[$1] = (NF >= 14 && $14 != "") ? $14 : "unknown"
             }
             next
         }
@@ -2183,14 +2499,18 @@ route_candidate_health_summary() {
             latency = ($4 ~ /^[0-9]+$/) ? $4 + 0 : 99999999
             total = ((ip in samples) && samples[ip] > 0) ? samples[ip] : 1
             ok = (ip in successes) ? successes[ip] : (($5 == "true") ? 1 : 0)
-            success_penalty = int(((total - ok) * 1000) / total)
+            recent = (ip in recent_failures) ? recent_failures[ip] : 0
+            success_penalty = int(((total - ok) * 1000) / total) + (recent * 75)
             avg_ms = ((ip in avg) && avg[ip] > 0) ? avg[ip] : latency
+            score_ms = ((ip in ewma) && ewma[ip] > 0) ? ewma[ip] : avg_ms
             last_ms = ((ip in latest) && latest[ip] > 0) ? latest[ip] : latency
             pinned_rank = (ip == pinned) ? 0 : 1
-            line = sprintf("%-15s HTTP %-3s last=%sms avg=%sms success=%s/%s usable=%s",
-                ip, $3, last_ms, avg_ms, ok, total, $5)
+            source = (NF >= 6 && $6 != "") ? $6 : "unknown"
+            reason = (NF >= 7 && $7 != "") ? $7 : ((ip in last_reason) ? last_reason[ip] : "unknown")
+            line = sprintf("%-15s HTTP %-3s last=%sms avg=%sms success=%s/%s recent=%sms recent_fail=%s usable=%s source=%s reason=%s",
+                ip, $3, last_ms, avg_ms, ok, total, score_ms, recent, $5, source, reason)
             printf "%d\t%d\t%04d\t%08d\t%08d\t%s\t%s\n",
-                pinned_rank, usable_rank, success_penalty, avg_ms, last_ms, ip, line
+                pinned_rank, usable_rank, success_penalty, score_ms, last_ms, ip, line
         }
     ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n \
         | while IFS=$'\t' read -r _pinned _usable _success _avg _latest ip line; do
@@ -2353,9 +2673,16 @@ show_live_monitor() {
     done
 }
 
+safe_max_fallback_links() {
+    local max="${1:-$MAX_FALLBACK_LINKS}"
+    [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=20
+    (( max > 64 )) && max=64
+    printf '%s' "$max"
+}
+
 usable_fallback_ips() {
-    local ip ip_probe ip_ms count=0 max_links="$MAX_FALLBACK_LINKS" candidates usable probe_cap min_probe_cap probed=0
-    [[ "$max_links" =~ ^[0-9]+$ && "$max_links" -gt 0 ]] || max_links=3
+    local ip ip_probe ip_ms reason count=0 max_links candidates usable probe_cap min_probe_cap probed=0
+    max_links=$(safe_max_fallback_links)
     probe_cap=$(route_monitor_max_candidates)
     min_probe_cap=$(( max_links * 3 ))
     (( probe_cap < min_probe_cap )) && probe_cap=$min_probe_cap
@@ -2377,20 +2704,24 @@ usable_fallback_ips() {
     while IFS= read -r ip; do
         [[ -n "$ip" ]] || continue
         candidate_blacklisted "$ip" && continue
+        route_candidate_cooldown_active "$ip" && ! route_candidate_cooldown_bypass "$ip" && continue
         if (( probed >= probe_cap )); then
             log_event WARN "fallback_route_filter probe_cap_reached probed=${probed} max=${probe_cap}"
             break
         fi
         probed=$((probed + 1))
-        read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
-        update_route_candidate_stats "$ip" "$ip_probe" "$ip_ms" || true
+        read -r ip_probe ip_ms reason < <(xhttp_probe_metrics external "$ip")
+        [[ -n "$reason" ]] || reason=$(route_failure_reason_for_status "$ip_probe")
+        update_route_candidate_stats "$ip" "$ip_probe" "$ip_ms" "live_fallback_probe" "$reason" || true
         if xhttp_status_usable "$ip_probe"; then
             printf '%s\n' "$ip"
             save_last_good_route "$ip" "$ip_probe" "$ip_ms" "live_fallback_probe"
             usable=true
             count=$((count + 1))
         else
-            log_event WARN "fallback_route_unusable ip=${ip} xhttp_probe=${ip_probe:-0} xhttp_probe_ms=${ip_ms:-0}"
+            [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" ]] \
+                && record_route_candidate_cooldown "$ip" "$reason"
+            log_event WARN "fallback_route_unusable ip=${ip} xhttp_probe=${ip_probe:-0} xhttp_probe_ms=${ip_ms:-0} reason=${reason}"
         fi
         (( count >= max_links )) && return 0
     done <<< "$candidates"
@@ -2406,8 +2737,8 @@ generate_ip_link() {
 }
 
 generate_ip_links() {
-    local address index=1 printed=false max_links="$MAX_FALLBACK_LINKS"
-    [[ "$max_links" =~ ^[0-9]+$ && "$max_links" -gt 0 ]] || max_links=3
+    local address index=1 printed=false max_links
+    max_links=$(safe_max_fallback_links)
     while IFS= read -r address; do
         [[ -n "$address" ]] || continue
         (( index > max_links )) && break
@@ -2428,6 +2759,47 @@ generate_ordered_links() {
     fi
 }
 
+git_remote_repo_slug() {
+    local url slug
+    url=$(git -C "$BASE_DIR" config --get remote.shaun.url 2>/dev/null || true)
+    [[ -n "$url" ]] || url=$(git -C "$BASE_DIR" config --get remote.origin.url 2>/dev/null || true)
+    [[ -n "$url" ]] || url=$(git -C "$BASE_DIR" config --get remote.upstream.url 2>/dev/null || true)
+    slug=$(printf '%s' "$url" | sed -nE 's#^https://github\.com/([^/]+/[^/.]+)(\.git)?$#\1#p; s#^git@github\.com:([^/]+/[^/.]+)(\.git)?$#\1#p')
+    [[ -n "$slug" ]] && printf '%s\n' "$slug"
+}
+
+subscription_url() {
+    local slug branch
+    slug=$(git_remote_repo_slug || true)
+    [[ -n "$slug" ]] || slug="$PROJECT_REPO"
+    branch="${G2RAY_SUBSCRIPTION_BRANCH:-main}"
+    printf 'https://raw.githubusercontent.com/%s/%s/configs-subscription-base64.txt' "$slug" "$branch"
+}
+
+write_config_metadata() {
+    local count="$1" hash="$2" sub_url generated max_links
+    sub_url=$(subscription_url)
+    max_links=$(safe_max_fallback_links)
+    generated=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+    cat > "$CONFIG_META_FILE" <<JSON
+{
+  "generated_at": "$(json_escape "$generated")",
+  "codespace": "$(json_escape "$CODESPACE_NAME")",
+  "domain": "$(json_escape "$PORT_DOMAIN")",
+  "port": ${XRAY_PORT},
+  "config_count": ${count:-0},
+  "max_fallback_links": ${max_links},
+  "hash": "$(json_escape "$hash")",
+  "mobile_config_file": "$(json_escape "$MOBILE_CONFIG_FILE")",
+  "subscription_file": "$(json_escape "$SUBSCRIPTION_FILE")",
+  "subscription_url": "$(json_escape "$sub_url")",
+  "performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
+  "low_overhead": $(low_overhead_enabled && printf true || printf false)
+}
+JSON
+    chmod 600 "$CONFIG_META_FILE" 2>/dev/null || true
+}
+
 write_config_exports_from_links() {
     local links encoded count hash
     links=$(printf '%s\n' "$@" | awk 'NF')
@@ -2439,6 +2811,7 @@ write_config_exports_from_links() {
     fi
     count=$(printf '%s\n' "$links" | awk 'NF {c++} END {print c+0}')
     hash=$(fingerprint_secret "$links")
+    write_config_metadata "$count" "$hash"
     log_event INFO "config_exports refreshed count=${count} hash=${hash}"
 }
 
@@ -2691,6 +3064,9 @@ show_diagnostics() {
     echo -e "\n  ${WHITE}${B}Resume Gap${NC}"
     resume_gap_summary | sed 's/^/  /'
 
+    echo -e "\n  ${WHITE}${B}Boot Status${NC}"
+    boot_status_summary | sed 's/^/  /'
+
     echo -e "\n  ${WHITE}${B}Last Known State${NC}"
     last_known_state_summary | sed 's/^/  /'
 
@@ -2741,6 +3117,12 @@ show_diagnostics() {
     echo -e "  Diagnostics    : ${WHITE}${DIAGNOSTIC_LOG_FILE}${NC}"
     echo -e "  Xray errors     : ${WHITE}${LOG_DIR}/xray-error.log${NC}"
     echo -e "  ${DIM}These files persist across panel screens and are rotated by size.${NC}"
+
+    echo -e "\n  ${WHITE}${B}Runtime Tuning${NC}"
+    echo -e "  Performance profile : ${WHITE}${PERFORMANCE_PROFILE}${NC}"
+    echo -e "  Low-overhead mode   : ${WHITE}$(low_overhead_summary)${NC}"
+    echo -e "  Private subscription URL : ${WHITE}$(subscription_url)${NC}"
+    echo -e "  ${DIM}Only publish generated exports through a private repo/channel; public repos expose live credentials.${NC}"
 
     echo -e "\n  ${WHITE}${B}Recent G2ray Events${NC}"
     if [[ -s "$LOG_FILE" ]]; then
@@ -3106,6 +3488,12 @@ if [[ "${1:-}" == "--doctor-json" || "${1:-}" == "--status-json" || ( "${1:-}" =
     exit 0
 fi
 
+if [[ "${1:-}" == "--print-subscription-url" || "${1:-}" == "subscription-url" ]]; then
+    subscription_url
+    printf '\n'
+    exit 0
+fi
+
 if [[ "${1:-}" == "--support-bundle" || "${1:-}" == "support-bundle" ]]; then
     create_support_bundle
     exit $?
@@ -3127,7 +3515,19 @@ if [[ "${1:-}" == "--background-supervisor" ]]; then
 fi
 
 if [[ "${1:-}" == "--silent-start" ]]; then
-    ensure_runtime_ready "silent_start" >/dev/null 2>&1 || true
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        write_boot_status "no_config" "silent_start" "No config exists yet; open the panel and generate one." "0" "0"
+    elif ensure_runtime_ready "silent_start" >/dev/null 2>&1; then
+        read -r _boot_code _boot_ms < <(xhttp_probe_metrics external)
+        write_boot_status "ready" "silent_start" "Xray started and the Codespaces route is usable." "${_boot_code:-0}" "${_boot_ms:-0}"
+    else
+        read -r _boot_code _boot_ms < <(xhttp_probe_metrics external)
+        if [[ "${_boot_code:-0}" == "404" ]]; then
+            write_boot_status "route_settling" "silent_start" "Xray is up, but GitHub's app route is still settling. Wait, check health, or run Recover Now." "${_boot_code:-0}" "${_boot_ms:-0}"
+        else
+            write_boot_status "needs_attention" "silent_start" "Startup completed but the external route is not usable yet." "${_boot_code:-0}" "${_boot_ms:-0}"
+        fi
+    fi
     start_background_tasks
     exit 0
 fi
@@ -3188,6 +3588,11 @@ while true; do
         _KA="${DIM}Disabled${NC}"
         _KA_LABEL="${DIM}currently Disabled${NC}"
     fi
+    if low_overhead_enabled; then
+        _LOW_LABEL="${GREEN}currently Enabled${NC}"
+    else
+        _LOW_LABEL="${DIM}currently Disabled${NC}"
+    fi
 
     echo -e "  ${WHITE}${B}Engine Status  :${NC} $(echo -e "$_STATUS")"
     echo -e "  ${WHITE}${B}Anti-Sleep Mode:${NC} $(echo -e "$_KA")\n"
@@ -3200,6 +3605,7 @@ while true; do
     echo -e "  ${WHITE}${B}● SYSTEM CONFIGURATION${NC}"
     echo -e "   ${RED}7)${NC} Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))"
     echo -e "   ${RED}8)${NC} Donate Config"
+    echo -e "  ${RED}18)${NC} Toggle Low-Overhead Mode ($(echo -e "$_LOW_LABEL"))"
     echo ""
     echo -e "  ${WHITE}${B}● ANALYTICS & TOOLS${NC}"
     echo -e "   ${RED}9)${NC} Data Usage                 ${RED}12)${NC} Server Location"
@@ -3273,6 +3679,8 @@ while true; do
             echo -e "  ${RED}● Configs & QR Codes${NC}"
             echo -e "  ${DIM}Raw links are printed without color codes and saved to:${NC}"
             echo -e "  ${DIM}Base64 subscription export:${NC} ${WHITE}${SUBSCRIPTION_FILE}${NC}"
+            echo -e "  ${DIM}Private subscription URL:${NC} ${WHITE}$(subscription_url)${NC}"
+            echo -e "  ${DIM}Generated exports are ignored by git because public repos expose live credentials.${NC}"
             echo -e "  ${WHITE}${MOBILE_CONFIG_FILE}${NC}\n"
             _INDEX=1
             _QR_MODE="${G2RAY_QR_MODE:-recommended}"
@@ -3397,6 +3805,16 @@ while true; do
         15) show_recovery_waker ;;
         16) show_live_monitor ;;
         17) show_route_candidate_manager ;;
+        18)
+            if toggle_low_overhead_mode; then
+                echo -e "\n  ${GREEN}Low-overhead mode enabled.${NC}"
+                echo -e "  ${DIM}Background route refresh and INFO logs are reduced.${NC}"
+            else
+                echo -e "\n  ${WHITE}Low-overhead mode disabled.${NC}"
+                echo -e "  ${DIM}Full background monitoring is restored.${NC}"
+            fi
+            sleep 2
+            ;;
         0) echo -e "\n  ${GREEN}Exiting G2ray Panel...${NC}"; exit 0 ;;
         *) echo -e "  ${RED}✖ Invalid option.${NC}"; sleep 1 ;;
     esac

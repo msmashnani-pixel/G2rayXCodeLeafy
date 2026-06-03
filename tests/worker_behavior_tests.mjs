@@ -49,12 +49,14 @@ async function testFailedSecretRateLimit() {
   }
   const body = await responseJson(last);
   assert.equal(last.status, 429);
+  assert.equal(last.headers.get("retry-after"), "600");
   assert.equal(body.reason, "worker_wake_secret_rate_limited");
   assert.equal(body.retry_after_seconds, 600);
   console.log("PASS: Worker rate-limits repeated bad wake secrets");
 }
 
 async function testGithubRateLimitClassification() {
+  const resetEpoch = Math.ceil(Date.now() / 1000) + 120;
   globalThis.fetch = async (input) => {
     const url = String(input);
     if (url.includes("api.github.com")) {
@@ -63,7 +65,7 @@ async function testGithubRateLimitClassification() {
         headers: {
           "content-type": "application/json",
           "x-ratelimit-remaining": "0",
-          "x-ratelimit-reset": "1780000000"
+          "x-ratelimit-reset": String(resetEpoch)
         }
       });
     }
@@ -76,10 +78,175 @@ async function testGithubRateLimitClassification() {
   const response = await worker.fetch(makeRequest("/api/health"), baseEnv(), {});
   const body = await responseJson(response);
   assert.equal(response.status, 429);
+  assert.equal(Number(response.headers.get("retry-after")) > 0, true);
   assert.equal(body.reason, "github_rate_limited");
-  assert.equal(body.retry_after_epoch, 1780000000);
+  assert.equal(body.retry_after_epoch, resetEpoch);
   assert.match(body.next_action, /GitHub is throttling/);
   console.log("PASS: Worker classifies GitHub primary rate limits");
+}
+
+async function testGithubScopeFailureClassification() {
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({ message: "Resource not accessible by personal access token" }), {
+        status: 403,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/health"), baseEnv(), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 403);
+  assert.equal(body.reason, "github_token_scope_missing");
+  assert.match(body.next_action, /codespace scope/);
+  console.log("PASS: Worker classifies token scope failures distinctly");
+}
+
+async function testWakeSettlingIncludesRetryMetadata() {
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ state: "Available" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      return new Response("", { status: 404 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+    ROUTE_WAIT_MS: "1",
+    ROUTE_POLL_INTERVAL_MS: "1"
+  }), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 202);
+  assert.equal(response.headers.get("retry-after"), "5");
+  assert.equal(body.route_ready, false);
+  assert.equal(body.retry_after_seconds, 5);
+  assert.equal(body.poll_after_seconds, 5);
+  assert.equal(body.route_probe.route_failure_reason, "route_settling_404");
+  console.log("PASS: Worker settling responses include retry and route failure metadata");
+}
+
+async function testHealthCanSkipRouteProbe() {
+  let routeCalls = 0;
+  const kv = makeKv();
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/health?route=false"), baseEnv({ WAKER_KV: kv }), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.route_checked, false);
+  assert.equal(body.route_ready, null);
+  assert.equal(routeCalls, 0);
+  const history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
+  assert.equal(history.history[0].route_checked, false);
+  assert.equal(history.history[0].route_ready, null);
+  console.log("PASS: Worker health can skip route probing for cheap status checks");
+}
+
+async function testHealthSkipRoutePreservesGithubFailureGuidance() {
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({ message: "Resource not accessible by personal access token" }), {
+        status: 403,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/health?route=false"), baseEnv(), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 403);
+  assert.equal(body.reason, "github_token_scope_missing");
+  assert.match(body.message, /codespace scope/i);
+  assert.match(body.next_action, /codespace scope/i);
+  assert.doesNotMatch(body.message, /route probe skipped/i);
+  console.log("PASS: Worker route-skipped health preserves GitHub failure guidance");
+}
+
+async function testAuthorizedWakeCooldownIsOptional() {
+  let routeCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ state: "Available" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = baseEnv({ WAKER_KV: makeKv(), WAKE_COOLDOWN_SECONDS: "1" });
+  const first = await worker.fetch(makeRequest("/api/wake"), env, {});
+  const firstBody = await responseJson(first);
+  assert.equal(first.status, 200);
+  assert.equal(firstBody.route_ready, true);
+
+  const second = await worker.fetch(makeRequest("/api/wake"), env, {});
+  const secondBody = await responseJson(second);
+  assert.equal(second.status, 429);
+  assert.equal(second.headers.get("retry-after"), "60");
+  assert.equal(secondBody.reason, "wake_recently_succeeded");
+  assert.equal(secondBody.retry_after_seconds, 60);
+  assert.equal(routeCalls >= 2, true);
+  console.log("PASS: Worker optional wake cooldown prevents repeated successful wake spam");
 }
 
 async function testGithubHttp429Classification() {
@@ -591,6 +758,7 @@ async function testWakeDoesNotClaimReadyFromSingleDeadlineProbe() {
   assert.equal(body.route_probe.http_status, 200);
   assert.equal(body.route_probe.stable_probes, 1);
   assert.equal(body.route_probe.error, "route_stability_not_confirmed");
+  assert.equal(body.route_probe.route_failure_reason, "route_stability_not_confirmed");
   assert.equal(routeCalls, 1);
   console.log("PASS: Worker does not claim route ready from one deadline-limited probe");
 }
@@ -629,6 +797,7 @@ async function testHealthRequiresStableRouteReadiness() {
   assert.equal(body.route_probe.usable, true);
   assert.equal(body.route_probe.stable_probes, 1);
   assert.equal(body.route_probe.error, "route_stability_not_confirmed");
+  assert.equal(body.route_probe.route_failure_reason, "route_stability_not_confirmed");
   assert.equal(routeCalls, 1);
   console.log("PASS: Worker health requires stable route readiness");
 }
@@ -911,6 +1080,11 @@ async function testDeferredNotificationFailureIsMarkedDeferred() {
 try {
   await testFailedSecretRateLimit();
   await testGithubRateLimitClassification();
+  await testGithubScopeFailureClassification();
+  await testWakeSettlingIncludesRetryMetadata();
+  await testHealthCanSkipRouteProbe();
+  await testHealthSkipRoutePreservesGithubFailureGuidance();
+  await testAuthorizedWakeCooldownIsOptional();
   await testGithubHttp429Classification();
   await testQuotaBlockIncludesSurvivalFields();
   await testRetentionMissingFieldsAreUnknown();

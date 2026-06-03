@@ -12,8 +12,10 @@ const HISTORY_KEY_PREFIX = "history:";
 const QUOTA_INCIDENT_KEY_PREFIX = "quota-incident:";
 const HISTORY_LIMIT = 50;
 const FAILED_AUTH_KEY_PREFIX = "failed-auth:";
+const SUCCESSFUL_WAKE_KEY_PREFIX = "successful-wake:";
 const FAILED_AUTH_WINDOW_SECONDS = 600;
 const FAILED_AUTH_MAX_ATTEMPTS = 10;
+const DEFAULT_ROUTE_POLL_AFTER_SECONDS = 5;
 const QUOTA_CRON_DAILY_INTERVAL_MS = 23 * 60 * 60 * 1000;
 const QUOTA_CRON_NEAR_RESET_INTERVAL_MS = 60 * 60 * 1000;
 const QUOTA_CRON_NEAR_RESET_WINDOW_MS = 6 * 60 * 60 * 1000;
@@ -62,10 +64,15 @@ export default {
 
 async function handleWake(request, env, ctx) {
   const context = await requireAuthorizedContext(request, env);
-  if (!context.ok) return json(context.body, context.status);
+  if (!context.ok) return json(context.body, context.status, retryHeaders(context.body));
+
+  const cooldown = await rateLimitSuccessfulWake(context.codespaceName, env);
+  if (cooldown) return json(cooldown.body, cooldown.status, retryHeaders(cooldown.body));
 
   const data = withSurvivalFields(await startCodespaceData(context.codespaceName, context.token, env), env);
   data.next_action = data.next_action || nextActionForWake(data, data.route_probe || {});
+  const responseStatus = responseStatusFor(data);
+  applyResponseHints(data, responseStatus, env);
   const event = eventFromResult("wake", context.codespaceName, data);
   const historyRecorded = await recordHistory(env, {
     ...event,
@@ -73,6 +80,7 @@ async function handleWake(request, env, ctx) {
   });
   const quotaIncident = await recordQuotaIncident(env, event, data);
   const notifications = await queueNotifications(env, event, ctx);
+  await rememberSuccessfulWake(context.codespaceName, env, data);
 
   return json({
     ...data,
@@ -85,34 +93,44 @@ async function handleWake(request, env, ctx) {
     notification_status: notifications.status,
     notifications_deferred: notifications.deferred,
     notification_errors: notifications.errors
-  }, responseStatusFor(data));
+  }, responseStatus, retryHeaders(data));
 }
 
 async function handleHealth(request, env, ctx) {
   const context = await requireAuthorizedContext(request, env);
-  if (!context.ok) return json(context.body, context.status);
+  if (!context.ok) return json(context.body, context.status, retryHeaders(context.body));
 
+  const url = new URL(request.url);
+  const checkRoute = url.searchParams.get("route") !== "false";
   const codespaceName = context.codespaceName;
   const status = await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN);
-  const routeProbe = status.ok
+  const routeProbe = status.ok && checkRoute
     ? await waitForXhttpRoute(codespaceName, codespacePort(env), env)
     : {
         url: routeUrl(codespaceName, codespacePort(env)),
         usable: false,
-        http_status: 0,
+        http_status: checkRoute ? 0 : null,
         latency_ms: null,
         attempts: 0,
         waited_ms: 0,
         stable_probes: 0,
-        error: "github_status_not_ok"
+        error: checkRoute ? "github_status_not_ok" : "route_check_skipped",
+        route_failure_reason: checkRoute ? "github_status_not_ok" : "not_checked"
       };
   const data = withSurvivalFields({
     ...status,
-    route_ready: isRouteReadyProbe(routeProbe),
+    route_checked: checkRoute,
+    route_ready: checkRoute ? isRouteReadyProbe(routeProbe) : null,
     route_probe: routeProbe,
-    next_action: nextActionForWake(status, routeProbe),
-    message: healthMessage(status, routeProbe)
+    next_action: status.ok && !checkRoute
+      ? "Route probe skipped. Use Check Health normally when you need route readiness."
+      : nextActionForWake(status, routeProbe),
+    message: status.ok && !checkRoute
+      ? "GitHub state checked; route probe skipped by request."
+      : healthMessage(status, routeProbe)
   }, env);
+  const responseStatus = responseStatusFor(data);
+  applyResponseHints(data, responseStatus, env);
   const event = eventFromResult("health", codespaceName, data);
   const historyRecorded = await recordHistory(env, {
     ...event,
@@ -132,12 +150,12 @@ async function handleHealth(request, env, ctx) {
     notification_status: notifications.status,
     notifications_deferred: notifications.deferred,
     notification_errors: notifications.errors
-  }, responseStatusFor(data));
+  }, responseStatus, retryHeaders(data));
 }
 
 async function handleHistory(request, env) {
   const context = await requireAuthorizedContext(request, env);
-  if (!context.ok) return json(context.body, context.status);
+  if (!context.ok) return json(context.body, context.status, retryHeaders(context.body));
 
   const history = await readHistory(env, context.codespaceName);
   const quotaIncident = await readQuotaIncident(env, context.codespaceName);
@@ -199,6 +217,45 @@ async function rateLimitFailedAuth(request, env) {
     return null;
   }
   return null;
+}
+
+async function rateLimitSuccessfulWake(codespaceName, env) {
+  if (!env.WAKER_KV) return null;
+  const seconds = configuredCooldownSeconds(env, "WAKE_COOLDOWN_SECONDS", 0, 3600);
+  if (!seconds) return null;
+  const key = SUCCESSFUL_WAKE_KEY_PREFIX + encodeURIComponent(codespaceName);
+  try {
+    const raw = await env.WAKER_KV.get(key);
+    if (!raw) return null;
+    return {
+      ok: false,
+      status: 429,
+      body: {
+        ok: false,
+        status: 429,
+        codespace: codespaceName,
+        reason: "wake_recently_succeeded",
+        retry_after_seconds: seconds,
+        message: "A wake request already succeeded recently. Wait before sending another start request."
+      }
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function rememberSuccessfulWake(codespaceName, env, data) {
+  if (!env.WAKER_KV || !data || data.ok !== true) return false;
+  const seconds = configuredCooldownSeconds(env, "WAKE_COOLDOWN_SECONDS", 0, 3600);
+  if (!seconds) return false;
+  if (data.route_ready !== true && data.start_accepted !== true) return false;
+  const key = SUCCESSFUL_WAKE_KEY_PREFIX + encodeURIComponent(codespaceName);
+  try {
+    await env.WAKER_KV.put(key, new Date().toISOString(), { expirationTtl: seconds });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function failedAuthKey(request) {
@@ -411,17 +468,15 @@ async function getCodespaceStatus(codespaceName, token) {
 }
 
 function githubFailureForResponse(res, body, codespaceName) {
+  const rateFields = githubRateFields(res);
   if (res.status === 429) {
-    const rateReset = res.headers.get("x-ratelimit-reset");
-    const retryAfter = res.headers.get("retry-after");
     return {
       ok: false,
       status: res.status,
       codespace: codespaceName,
       reason: "github_rate_limited",
       detail: githubErrorDetail(body),
-      retry_after_seconds: retryAfter ? Number.parseInt(retryAfter, 10) || null : null,
-      retry_after_epoch: rateReset ? Number.parseInt(rateReset, 10) || null : null,
+      ...rateFields,
       message: "GitHub API rate limit reached. Wait for the reset window, then try again."
     };
   }
@@ -450,31 +505,43 @@ function githubFailureForResponse(res, body, codespaceName) {
   }
 
   if (res.status === 403) {
-    const rateRemaining = res.headers.get("x-ratelimit-remaining");
-    const rateReset = res.headers.get("x-ratelimit-reset");
-    const retryAfter = res.headers.get("retry-after");
     const message = String(body && typeof body === "object" ? body.message || "" : body || "").toLowerCase();
-    if (rateRemaining === "0") {
+    if (rateFields.github_rate_limit_remaining === 0) {
       return {
         ok: false,
         status: 429,
         codespace: codespaceName,
         reason: "github_rate_limited",
         detail: githubErrorDetail(body),
-        retry_after_seconds: retryAfter ? Number.parseInt(retryAfter, 10) || null : null,
-        retry_after_epoch: rateReset ? Number.parseInt(rateReset, 10) || null : null,
+        ...rateFields,
         message: "GitHub API rate limit reached. Wait for the reset window, then try again."
       };
     }
-    if (retryAfter || message.includes("secondary rate limit") || message.includes("abuse detection")) {
+    if (rateFields.retry_after_seconds || message.includes("secondary rate limit") || message.includes("abuse detection")) {
       return {
         ok: false,
         status: 429,
         codespace: codespaceName,
         reason: "github_secondary_rate_limited",
         detail: githubErrorDetail(body),
-        retry_after_seconds: retryAfter ? Number.parseInt(retryAfter, 10) || null : null,
+        ...rateFields,
         message: "GitHub temporarily throttled this token. Wait, then try again."
+      };
+    }
+    if (
+      message.includes("resource not accessible") ||
+      message.includes("must have the codespace scope") ||
+      message.includes("missing scope") ||
+      message.includes("requires codespace")
+    ) {
+      return {
+        ok: false,
+        status: res.status,
+        codespace: codespaceName,
+        reason: "github_token_scope_missing",
+        detail: githubErrorDetail(body),
+        token_warning: "GitHub token is missing the codespace scope",
+        message: "GitHub token was accepted, but it cannot access Codespaces. Create a classic token with the codespace scope."
       };
     }
     return {
@@ -502,6 +569,27 @@ function githubFailureForResponse(res, body, codespaceName) {
   return null;
 }
 
+function githubRateFields(res) {
+  const retryAfter = parseNullableInt(res.headers.get("retry-after"));
+  const reset = parseNullableInt(res.headers.get("x-ratelimit-reset"));
+  const remaining = parseNullableInt(res.headers.get("x-ratelimit-remaining"));
+  const limit = parseNullableInt(res.headers.get("x-ratelimit-limit"));
+  const resource = res.headers.get("x-ratelimit-resource") || null;
+  return {
+    retry_after_seconds: retryAfter,
+    retry_after_epoch: reset,
+    github_rate_limit_remaining: remaining,
+    github_rate_limit_limit: limit,
+    github_rate_limit_resource: resource
+  };
+}
+
+function parseNullableInt(value) {
+  if (value == null || value === "") return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function githubHeaders(token) {
   return {
     accept: "application/vnd.github+json",
@@ -522,6 +610,33 @@ function responseStatusFor(data) {
   if (data.ok) return 200;
   if ([401, 402, 403, 404, 429].includes(data.status)) return data.status;
   return 502;
+}
+
+function applyResponseHints(data, status, env) {
+  if (!data || typeof data !== "object") return data;
+  if (status === 202 && !data.retry_after_seconds) {
+    data.retry_after_seconds = configuredNumber(env, "ROUTE_POLL_AFTER_SECONDS", DEFAULT_ROUTE_POLL_AFTER_SECONDS, 1, 120);
+  }
+  if ((status === 202 || shouldPollRouteResponse(data)) && !data.poll_after_seconds) {
+    data.poll_after_seconds = data.retry_after_seconds || configuredNumber(env, "ROUTE_POLL_AFTER_SECONDS", DEFAULT_ROUTE_POLL_AFTER_SECONDS, 1, 120);
+  }
+  return data;
+}
+
+function shouldPollRouteResponse(data) {
+  return Boolean(data && (data.ok || data.start_accepted) && data.route_ready === false && data.quota_blocked !== true);
+}
+
+function retryHeaders(data) {
+  let retryAfter = data && Number.parseInt(String(data.retry_after_seconds || ""), 10);
+  if ((!Number.isFinite(retryAfter) || retryAfter <= 0) && data && data.retry_after_epoch) {
+    const epoch = Number.parseInt(String(data.retry_after_epoch), 10);
+    if (Number.isFinite(epoch)) {
+      retryAfter = Math.ceil((epoch * 1000 - Date.now()) / 1000);
+    }
+  }
+  if (!Number.isFinite(retryAfter) || retryAfter <= 0) return {};
+  return { "retry-after": String(retryAfter) };
 }
 
 function withSurvivalFields(data, env) {
@@ -631,12 +746,17 @@ function nextActionForWake(status, routeProbe) {
   if (status.reason === "github_token_rejected_or_missing_scope") {
     return "Rotate the GitHub token and make sure it has the codespace scope.";
   }
+  if (status.reason === "github_token_scope_missing") {
+    return "Create a new classic GitHub token with the codespace scope, then update Worker secret GITHUB_TOKEN.";
+  }
   if (!status.ok) return "Open GitHub Codespaces or rotate the GitHub token, then try the Worker again.";
   if (!isCodespaceAvailable(status)) return "Wait for GitHub to finish starting the Codespace, then press Check Health.";
   if (routeProbe.error === "route_stability_not_confirmed") {
     return "The route answered once, but stability was not confirmed yet. Wait a few seconds, then press Check Health or Start Codespace again.";
   }
   if (routeProbe.usable) return "Try the same VLESS config again.";
+  if (routeProbe.route_failure_reason === "edge_or_origin_error") return "GitHub's edge or origin returned a server error. Wait briefly, then Check Health; if it persists, open the panel and Recover Now.";
+  if (routeProbe.route_failure_reason === "timeout_or_unreachable" || routeProbe.route_failure_reason === "dns_tls_or_network_unreachable") return "The app.github.dev route did not answer from Cloudflare. Open the Codespace once, then check port visibility and panel diagnostics.";
   if (routeProbe.http_status === 404) return "Open the panel, check option 14 Diagnostics, then use option 6 Recover Now if the route stays 404.";
   if (routeProbe.http_status === 0) return "The app.github.dev route did not resolve or answer. Open the Codespace once, then check port 443 visibility and panel diagnostics.";
   return "Check panel option 14 Diagnostics; if XHTTP is not usable, use option 6 Recover Now.";
@@ -656,6 +776,7 @@ function healthMessage(status, routeProbe) {
 }
 
 function eventFromResult(kind, codespace, data) {
+  const routeChecked = data.route_checked !== false;
   return {
     ts: new Date().toISOString(),
     kind,
@@ -663,7 +784,8 @@ function eventFromResult(kind, codespace, data) {
     codespace,
     github_status: data.status || null,
     state: data.state || null,
-    route_ready: data.route_ready === true,
+    route_checked: routeChecked,
+    route_ready: routeChecked && data.route_ready != null ? data.route_ready === true : null,
     route_http_status: data.route_probe ? data.route_probe.http_status : null,
     route_latency_ms: data.route_probe ? data.route_probe.latency_ms : null,
     route_waited_ms: data.route_probe ? data.route_probe.waited_ms : null,
@@ -999,6 +1121,15 @@ function configuredMs(env, name, fallback, min, max) {
   return value;
 }
 
+function configuredNumber(env, name, fallback, min, max) {
+  return configuredMs(env, name, fallback, min, max);
+}
+
+function configuredCooldownSeconds(env, name, fallback, max) {
+  const value = configuredNumber(env, name, fallback, 0, max);
+  return value > 0 && value < 60 ? 60 : value;
+}
+
 async function waitForXhttpRoute(name, port, env) {
   const startedAt = Date.now();
   const routeWaitMs = configuredMs(env, "ROUTE_WAIT_MS", ROUTE_WAIT_MS, 1, 300000);
@@ -1042,7 +1173,8 @@ async function waitForXhttpRoute(name, port, env) {
     return {
       ...last,
       stable_probes: stableProbes,
-      error: "route_stability_not_confirmed"
+      error: "route_stability_not_confirmed",
+      route_failure_reason: "route_stability_not_confirmed"
     };
   }
   return last;
@@ -1060,9 +1192,11 @@ async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now())
       latency_ms: Date.now() - probeStartedAt,
       attempts,
       waited_ms: Date.now() - startedAt,
-      error: null
+      error: null,
+      route_failure_reason: routeFailureReason(res.status, null)
     };
   } catch (error) {
+    const reason = routeFailureReason(0, error);
     return {
       url,
       usable: false,
@@ -1070,7 +1204,8 @@ async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now())
       latency_ms: Date.now() - probeStartedAt,
       attempts,
       waited_ms: Date.now() - startedAt,
-      error: shortError(error)
+      error: shortError(error),
+      route_failure_reason: reason
     };
   }
 }
@@ -1096,16 +1231,30 @@ function isRouteStatusUsable(status) {
   return status === 200 || status === 400;
 }
 
+function routeFailureReason(status, error) {
+  if (isRouteStatusUsable(status)) return "ready";
+  if (status === 404) return "route_settling_404";
+  if (status === 0) {
+    const message = shortError(error).toLowerCase();
+    if (message.includes("abort") || message.includes("time") || message.includes("timeout")) return "timeout_or_unreachable";
+    return "dns_tls_or_network_unreachable";
+  }
+  if (status >= 500) return "edge_or_origin_error";
+  if (status === 401 || status === 403) return "auth_or_visibility_blocked";
+  return "unexpected_http_status";
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function json(data, status = 200) {
+function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: securityHeaders({
       "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store"
+      "cache-control": "no-store",
+      ...extraHeaders
     }, "json")
   });
 }
@@ -1359,6 +1508,7 @@ const latencyTrend = document.getElementById("latencyTrend");
 let lastStatusText = "";
 let polling = false;
 let pollTimer = null;
+let pollAfterSeconds = 5;
 
 document.getElementById("start").addEventListener("click", startWake);
 document.getElementById("health").addEventListener("click", checkHealth);
@@ -1467,7 +1617,7 @@ function shouldPollRoute(data) {
 function scheduleHealthPoll() {
   if (!polling) return;
   if (pollTimer) clearTimeout(pollTimer);
-  pollTimer = setTimeout(checkHealth, 5000);
+  pollTimer = setTimeout(checkHealth, Math.max(1, pollAfterSeconds) * 1000);
 }
 
 function stopPolling() {
@@ -1480,6 +1630,9 @@ function stopPolling() {
 function renderResult(data) {
   const route = data.route_probe || {};
   const routeReady = data.route_ready === true;
+  pollAfterSeconds = Number.isFinite(Number(data.poll_after_seconds || data.retry_after_seconds))
+    ? Number(data.poll_after_seconds || data.retry_after_seconds)
+    : 5;
   document.getElementById("githubState").textContent = data.state || (data.ok ? "Available" : "Problem");
   document.getElementById("routeState").textContent = routeReady ? "Route ready" : route.http_status ? "HTTP " + route.http_status : "Not reachable";
   document.getElementById("routeState").className = routeReady ? "good" : route.http_status === 404 ? "warn" : "bad";
@@ -1571,7 +1724,7 @@ function renderHistorySummary(events, quotaIncident) {
   historySummary.innerHTML = "";
   const cards = [
     ["Samples", String(summary.samples)],
-    ["Route ready", summary.ready + " / " + summary.samples],
+    ["Route ready", summary.ready + " / " + summary.routeSamples],
     ["HTTP 404", String(summary.http404)],
     ["Wake success", summary.wakeOk + " ok / " + summary.wakeFail + " fail"],
     ["Best latency", summary.bestLatency == null ? "None" : summary.bestLatency + "ms"],
@@ -1595,6 +1748,7 @@ function renderHistorySummary(events, quotaIncident) {
 function summarizeHistory(events) {
   const summary = {
     samples: events.length,
+    routeSamples: 0,
     ready: 0,
     http404: 0,
     wakeOk: 0,
@@ -1604,17 +1758,21 @@ function summarizeHistory(events) {
     lastStuck: ""
   };
   for (const event of events) {
-    if (event.route_ready === true) summary.ready += 1;
-    if (event.route_http_status === 404) summary.http404 += 1;
+    const routeChecked = event.route_checked !== false && event.route_ready !== null;
+    if (routeChecked) {
+      summary.routeSamples += 1;
+      if (event.route_ready === true) summary.ready += 1;
+      if (event.route_http_status === 404) summary.http404 += 1;
+    }
     if (event.kind === "wake" && event.ok) summary.wakeOk += 1;
     if (event.kind === "wake" && !event.ok) summary.wakeFail += 1;
     if (event.quota_blocked === true || event.reason === "quota_or_billing_blocked") summary.quotaBlocks += 1;
-    if (Number.isFinite(event.route_latency_ms)) {
+    if (routeChecked && Number.isFinite(event.route_latency_ms)) {
       summary.bestLatency = summary.bestLatency == null
         ? event.route_latency_ms
         : Math.min(summary.bestLatency, event.route_latency_ms);
     }
-    if (!summary.lastStuck && event.route_ready !== true && (event.route_http_status === 404 || event.route_http_status === 0)) {
+    if (routeChecked && !summary.lastStuck && event.route_ready !== true && (event.route_http_status === 404 || event.route_http_status === 0)) {
       const waited = event.route_waited_ms == null ? "" : ", waited " + event.route_waited_ms + "ms";
       summary.lastStuck = (event.ts || "unknown time") + " HTTP " + (event.route_http_status || 0) + waited;
     }

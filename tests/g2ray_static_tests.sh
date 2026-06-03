@@ -11,6 +11,7 @@ CONFIGS="$ROOT_DIR/configs.txt"
 DOCKERFILE="$ROOT_DIR/.devcontainer/Dockerfile"
 CI_WORKFLOW="$ROOT_DIR/.github/workflows/static-tests.yml"
 REOPEN_SCRIPT="$ROOT_DIR/scripts/reopen-codespace.ps1"
+POST_START_SCRIPT="$ROOT_DIR/scripts/post-start.sh"
 WORKER_DIR="$ROOT_DIR/worker/codespace-waker"
 WORKER_SCRIPT="$WORKER_DIR/src/index.js"
 WORKER_README="$WORKER_DIR/README.md"
@@ -146,10 +147,10 @@ test_exit_trap_preserves_failures() {
 
 test_generated_files_are_ignored() {
     [[ -f "$GITIGNORE" ]] || fail '.gitignore is missing'
-    for pattern in '/data/' '/logs/' '/configs-to-copy-for-mobile.txt' '/configs-subscription-base64.txt'; do
+    for pattern in '/data/' '/logs/' '/configs-to-copy-for-mobile.txt' '/configs-subscription-base64.txt' '/configs-meta.json'; do
         grep_fixed "$pattern" "$GITIGNORE" || fail ".gitignore missing $pattern"
     done
-    for pattern in '/configs-to-copy-for-mobile.txt.*' '/configs-subscription-base64.txt.*'; do
+    for pattern in '/configs-to-copy-for-mobile.txt.*' '/configs-subscription-base64.txt.*' '/configs-meta.json.*'; do
         grep_fixed "$pattern" "$GITIGNORE" || fail ".gitignore missing atomic temp pattern $pattern"
     done
     grep_fixed '/g2ray-support-*.tar.gz' "$GITIGNORE" \
@@ -420,8 +421,10 @@ test_runtime_control_paths_are_hardened() {
         || fail 'engine readiness does not verify the Xray/XHTTP listener, only an open port'
     grep_fixed 'while ! xray_listener_ready && (( i < 15 )); do' "$SCRIPT" \
         || fail 'wait_for_port still succeeds on any listener bound to the port'
-    grep_fixed 'ensure_runtime_ready "silent_start" >/dev/null 2>&1 || true' "$SCRIPT" \
+    grep_fixed 'elif ensure_runtime_ready "silent_start" >/dev/null 2>&1; then' "$SCRIPT" \
         || fail '--silent-start does not use the non-fatal health-gated startup path'
+    grep_fixed 'write_boot_status "route_settling" "silent_start"' "$SCRIPT" \
+        || fail '--silent-start does not persist route-settling boot status'
     grep_fixed 'if stop_xray; then' "$SCRIPT" \
         || fail 'interactive Stop Engine path does not handle stop_xray failure'
     pass 'runtime control paths are hardened'
@@ -624,8 +627,10 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker does not wait for the Codespaces XHTTP route after start'
     grep_fixed 'waitForXhttpRoute(codespaceName, codespacePort(env), env)' "$WORKER_SCRIPT" \
         || fail 'Worker health check does not use stable XHTTP route readiness'
-    grep_fixed 'route_ready: isRouteReadyProbe(routeProbe)' "$WORKER_SCRIPT" \
+    grep_fixed 'route_ready: checkRoute ? isRouteReadyProbe(routeProbe) : null' "$WORKER_SCRIPT" \
         || fail 'Worker route_ready is not derived from stable route probe state'
+    grep_fixed 'url.searchParams.get("route") !== "false"' "$WORKER_SCRIPT" \
+        || fail 'Worker health API does not support a cheap route-skip status check'
     grep_fixed 'method: "OPTIONS"' "$WORKER_SCRIPT" \
         || fail 'Worker route readiness probe does not use the XHTTP OPTIONS probe'
     grep_fixed 'route_ready:' "$WORKER_SCRIPT" \
@@ -779,8 +784,10 @@ test_worker_wake_edge_cases_are_hardened() {
         || fail 'Worker stop-polling button is not wired to stopPolling'
     grep_fixed 'function scheduleHealthPoll()' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard does not centralize health polling through a managed timer'
-    grep_fixed 'pollTimer = setTimeout(checkHealth, 5000)' "$WORKER_SCRIPT" \
+    grep_fixed 'pollTimer = setTimeout(checkHealth, Math.max(1, pollAfterSeconds) * 1000)' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard polling is not tracked through pollTimer'
+    grep_fixed 'pollAfterSeconds = Number.isFinite' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not honor poll_after_seconds/retry_after_seconds'
     grep_fixed 'clearTimeout(pollTimer)' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard does not clear pending poll timers'
     grep_fixed 'historyKey(codespace)' "$WORKER_SCRIPT" \
@@ -827,10 +834,14 @@ test_route_candidate_monitor_is_bounded() {
         || fail 'diagnostics cannot summarize route candidate health'
     grep_fixed 'cached_route_candidate_ips()' "$SCRIPT" \
         || fail 'previously measured route candidates are not reused across resolver refreshes'
-    grep_fixed 'record_route_candidate_health "$ip" "$ip_probe" "$ip_ms"' "$SCRIPT" \
+    grep_fixed 'record_route_candidate_health "$_ip" "$_code" "$_ms" "$_source" "$_reason"' "$SCRIPT" \
         || fail 'route candidate monitor does not persist per-candidate probe results'
-    grep_fixed 'update_route_candidate_stats "$ip" "$code" "$ms"' "$SCRIPT" \
-        || fail 'route candidate probes do not update rolling route stats'
+    grep_fixed 'update_route_candidate_stats "$ip" "$code" "$ms" "$source" "$reason"' "$SCRIPT" \
+        || fail 'route candidate probes do not update rolling route stats with metadata'
+    grep_fixed 'route_failure_reason_for_status()' "$SCRIPT" \
+        || fail 'route candidate probes do not classify route failure reasons'
+    grep_fixed 'ROUTE_PROBE_CONCURRENCY=' "$SCRIPT" \
+        || fail 'route candidate probes are not bounded-concurrent'
     grep_fixed 'success=' "$SCRIPT" \
         || fail 'route candidate diagnostics do not show route reliability'
     grep_fixed 'avg=' "$SCRIPT" \
@@ -1430,6 +1441,17 @@ test_devcontainer_tooling_is_not_duplicated() {
     pass 'devcontainer tooling and LF policy are clean'
 }
 
+test_devcontainer_post_start_wrapper_is_present() {
+    [[ -f "$POST_START_SCRIPT" ]] || fail 'devcontainer postStart wrapper script is missing'
+    grep_fixed 'bash ./scripts/post-start.sh' "$ROOT_DIR/.devcontainer/devcontainer.json" \
+        || fail 'devcontainer does not run the post-start wrapper'
+    grep_fixed '--silent-start' "$POST_START_SCRIPT" \
+        || fail 'post-start wrapper does not call the silent-start recovery path'
+    grep_fixed 'post-start.log' "$POST_START_SCRIPT" \
+        || fail 'post-start wrapper does not write a persistent post-start log'
+    pass 'devcontainer post-start wrapper is present and wired'
+}
+
 test_menu_loop_and_link_output_are_tidy() {
     if grep_fixed '( fetch_remote_message >/dev/null 2>&1 & )' "$SCRIPT"; then
         fail 'menu loop still starts a redundant remote-message fetch every render'
@@ -1526,5 +1548,6 @@ test_fallback_link_count_is_capped
 test_ci_runs_static_regressions
 test_docs_and_public_configs_are_consistent
 test_devcontainer_tooling_is_not_duplicated
+test_devcontainer_post_start_wrapper_is_present
 test_menu_loop_and_link_output_are_tidy
 test_donation_failures_are_not_suppressed

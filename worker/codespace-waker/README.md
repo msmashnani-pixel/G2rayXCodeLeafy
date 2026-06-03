@@ -10,7 +10,7 @@ The browser page is a small mobile-friendly health dashboard. It has a large **S
 
 After GitHub accepts the start request, the Worker waits for the Codespace state to become available, then probes the public `app.github.dev` XHTTP route. If the response says `route_ready: true`, the external route answered a usable XHTTP probe and the VLESS configs should usually be usable. If it says `route_ready: false`, follow the returned `next_action`; HTTP `404` usually means GitHub's port route is still settling, while HTTP `0` usually means DNS or the app route did not answer.
 
-When the start request is accepted but the route is still settling, the API returns HTTP `202` with `ok: true` and `route_ready: false`. The browser page keeps polling health until the route becomes ready or you stop checking.
+When the start request is accepted but the route is still settling, the API returns HTTP `202` with `ok: true`, `route_ready: false`, `retry_after_seconds`, `poll_after_seconds`, and a `Retry-After` header. The browser page keeps polling health until the route becomes ready or you stop checking.
 
 ## 1. Create a GitHub Token
 
@@ -136,12 +136,16 @@ Opening the Worker URL in a browser and entering the wake secret in the form is 
 
 If you create a new Codespace, change region, rename/recreate the Codespace, or change the panel's `XRAY_PORT`, update `CODESPACE_NAME` and optional `CODESPACE_PORT`, redeploy the Worker, then return to panel option `15` and save/test the Worker URL again.
 
+For automation that only needs GitHub state and wants to avoid an external route probe, call `POST /api/health?route=false`. Normal browser health checks should use `/api/health` so the dashboard can report route readiness.
+
 ## Expected Responses
 
 - `200` with `ok: true`: GitHub accepted or handled the start request.
 - `route_ready: true`: the XHTTP route returned HTTP `200` or `400` during the Worker wait window, matching the panel's route-readiness classifier.
 - `route_ready: false` with HTTP `404`: the Codespace started, but the GitHub route has not settled yet.
 - `route_ready: false` with HTTP `0`: DNS, TLS, or the app route did not answer before the Worker timeout.
+- `route_failure_reason`: machine-readable route reason such as `route_settling_404`, `timeout_or_unreachable`, `dns_tls_or_network_unreachable`, `edge_or_origin_error`, or `ready`.
+- `retry_after_seconds` / `poll_after_seconds`: how long the browser or automation should wait before checking again.
 - `next_action`: the fastest manual recovery step to try next.
 - `quota_blocked: true`: GitHub returned HTTP `402`, so quota or billing is blocking the start.
 - `quota_reset_estimate_utc`: the next first-of-month UTC estimate for included-usage reset.
@@ -153,9 +157,11 @@ If you create a new Codespace, change region, rename/recreate the Codespace, or 
 - `notification_status: "failed"`: notification delivery was attempted synchronously and `notification_errors` contains the delivery error.
 - `401`: Wrong wake secret, or GitHub rejected the stored token. Check the JSON `error`, `reason`, or `token_warning` field to tell which side rejected the request.
 - `402`: GitHub quota or billing blocked the start. Mark the Codespace as **Keep codespace**, wait for quota reset or adjust GitHub billing settings, then start the same Codespace again.
-- `403`: GitHub token is rejected, expired, or missing the right scope.
+- `403`: GitHub token was accepted but cannot access Codespaces, commonly because the `codespace` scope is missing. The response reason may be `github_token_scope_missing`.
 - `404`: Codespace name is wrong or the token cannot access it.
-- `429`: Either too many wrong wake-secret attempts hit the optional KV-backed Worker rate limit, or GitHub rate-limited the token. Check `reason` and `retry_after_seconds`.
+- `429`: Too many wrong wake-secret attempts, optional successful-wake cooldown, or GitHub rate limiting. Check `reason`, `retry_after_seconds`, and any `github_rate_limit_*` fields.
+
+Optional anti-spam setting: with `WAKER_KV` configured, set `WAKE_COOLDOWN_SECONDS` as a **Plaintext** variable if you want a successful wake to block repeated wake calls for a short period. Leave it unset to allow immediate manual retries. Any nonzero value below `60` is treated as `60` because Cloudflare KV expiration TTLs require at least 60 seconds.
 
 ## Security Notes
 

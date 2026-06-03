@@ -28,6 +28,11 @@ reset_runtime_paths() {
     UUID_FILE="$DATA_DIR/uuid.txt"
     ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
     ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
+    ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
+    BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
+    LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
+    LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
+    CONFIG_META_FILE="$TMP_ROOT/configs-meta.json"
     LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
     PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
     MANUAL_ROUTE_CANDIDATES_FILE="$DATA_DIR/manual_route_candidates.txt"
@@ -179,6 +184,22 @@ EOF
     pass "cached route health orders exports by reliability and average latency"
 }
 
+test_cached_route_order_uses_recent_weighted_score() {
+    reset_runtime_paths
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-05-30T00:00:00Z	20.0.0.1	200	120	true	dns	ready
+2026-05-30T00:00:00Z	20.0.0.2	200	260	true	dns	ready
+EOF
+    cat > "$ROUTE_STATS_FILE" <<'EOF'
+20.0.0.1	10	10	0	100	80	900	120	200	true	2026-05-30T00:00:00Z	900	0	ready
+20.0.0.2	10	10	0	250	220	300	260	200	true	2026-05-30T00:00:00Z	250	0	ready
+EOF
+    mapfile -t routes < <(cached_usable_fallback_ips)
+    [[ "${routes[0]:-}" == "20.0.0.2" ]] || fail "recent weighted route score did not outrank stale cumulative average"
+    [[ "${routes[1]:-}" == "20.0.0.1" ]] || fail "route with stale cumulative average was not kept second"
+    pass "cached route health orders exports by recent weighted score"
+}
+
 test_route_candidate_stats_track_average_and_success_rate() {
     reset_runtime_paths
     update_route_candidate_stats 20.0.0.1 200 100
@@ -193,6 +214,47 @@ test_route_candidate_stats_track_average_and_success_rate() {
     route_candidate_health_summary | grep -Fq 'avg=200ms success=2/3' \
         || fail "route candidate summary does not show average latency and success ratio"
     pass "route candidate stats track rolling average and reliability"
+}
+
+test_route_health_records_source_reason_and_recent_average() {
+    reset_runtime_paths
+    record_route_candidate_health 20.0.0.1 200 100 dns ready
+    record_route_candidate_health 20.0.0.1 0 900 dns timeout
+    record_route_candidate_health 20.0.0.1 200 300 dns ready
+
+    local health_row stats_row
+    health_row=$(tail -n 1 "$ROUTE_HEALTH_FILE")
+    [[ "$health_row" == *$'\t20.0.0.1\t200\t300\ttrue\tdns\tready' ]] \
+        || fail "route health did not record source and reason: $health_row"
+    stats_row=$(awk -F '\t' '$1 == "20.0.0.1" {print $0}' "$ROUTE_STATS_FILE")
+    awk -F '\t' '$1 == "20.0.0.1" && $12 ~ /^[0-9]+$/ && $13 ~ /^[0-9]+$/ && $14 == "ready" { found = 1 } END { exit !found }' "$ROUTE_STATS_FILE" \
+        || fail "route stats did not persist ewma/recent failures/reason metadata: $stats_row"
+    pass "route health records source, failure reason, and recent average metadata"
+}
+
+test_route_failure_reason_classifier() {
+    reset_runtime_paths
+    [[ "$(route_failure_reason_for_status 200 "")" == "ready" ]] || fail "HTTP 200 should classify ready"
+    [[ "$(route_failure_reason_for_status 400 "")" == "ready" ]] || fail "HTTP 400 should classify ready"
+    [[ "$(route_failure_reason_for_status 404 "")" == "route_settling_404" ]] || fail "HTTP 404 should classify route settling"
+    [[ "$(route_failure_reason_for_status 0 "operation timed out")" == "timeout_or_unreachable" ]] || fail "HTTP 0 timeout should classify unreachable"
+    [[ "$(route_failure_reason_for_status 503 "")" == "edge_or_origin_error" ]] || fail "HTTP 503 should classify edge/origin error"
+    pass "route failure reason classifier is actionable"
+}
+
+test_xhttp_probe_metrics_reports_curl_failure_reason() {
+    reset_runtime_paths
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    XRAY_PORT=443
+    curl() { return 28; }
+
+    local code ms reason
+    read -r code ms reason < <(xhttp_probe_metrics external 20.0.0.1)
+    unset -f curl
+    [[ "$code" == "0" ]] || fail "curl timeout probe did not report HTTP 0: $code"
+    [[ "$reason" == "timeout_or_unreachable" ]] || fail "curl timeout probe did not report actionable reason: $reason"
+    pass "xhttp probe metrics reports curl failure reason"
 }
 
 test_cached_route_order_prefers_pinned_route_then_latency_without_stats() {
@@ -277,11 +339,58 @@ EOF
     [[ ! -e "$ROUTE_HEALTH_FILE" ]] || fail "route health cache was not reset"
     [[ ! -e "$ROUTE_STATS_FILE" ]] || fail "route stats cache was not reset"
     [[ ! -e "$LAST_GOOD_ROUTE_FILE" ]] || fail "last-good route cache was not reset"
+    [[ ! -e "$ROUTE_COOLDOWN_FILE" ]] || fail "route cooldown cache was not reset"
     reset_route_candidate_state
     [[ ! -e "$MANUAL_ROUTE_CANDIDATES_FILE" ]] || fail "manual route file was not reset"
     [[ ! -e "$PINNED_ROUTE_FILE" ]] || fail "pinned route file was not reset"
     [[ ! -e "$BLACKLISTED_ROUTE_CANDIDATES_FILE" ]] || fail "blacklist route file was not reset"
     pass "manual route candidates are validated and route manager cache/state resets are safe"
+}
+
+test_route_preferences_clear_matching_cooldowns() {
+    reset_runtime_paths
+    local future
+    future=$(( $(date +%s) + 3600 ))
+
+    printf '%s\t20.0.0.9\ttimeout_or_unreachable\n' "$future" > "$ROUTE_COOLDOWN_FILE"
+    add_manual_route_candidate 20.0.0.9 || fail "manual route add failed"
+    [[ ! -e "$ROUTE_COOLDOWN_FILE" ]] || fail "manual route add did not clear matching cooldown"
+
+    printf '%s\t20.0.0.10\ttimeout_or_unreachable\n' "$future" > "$ROUTE_COOLDOWN_FILE"
+    pin_route_candidate 20.0.0.10 || fail "pin route failed"
+    [[ ! -e "$ROUTE_COOLDOWN_FILE" ]] || fail "pinning a route did not clear matching cooldown"
+
+    printf '%s\t20.0.0.11\ttimeout_or_unreachable\n' "$future" > "$ROUTE_COOLDOWN_FILE"
+    printf '20.0.0.11\n' > "$BLACKLISTED_ROUTE_CANDIDATES_FILE"
+    unblacklist_route_candidate 20.0.0.11 || fail "unblacklist route failed"
+    [[ ! -e "$ROUTE_COOLDOWN_FILE" ]] || fail "unblacklisting a route did not clear matching cooldown"
+    pass "manual, pinned, and unblacklisted routes clear matching cooldowns"
+}
+
+test_route_health_refresh_preserves_cache_when_all_candidates_are_cooled_down() {
+    reset_runtime_paths
+    touch "$CONFIG_FILE"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    ROUTE_PROBE_CONCURRENCY=2
+    local future original_resolver original_probe
+    future=$(( $(date +%s) + 3600 ))
+    original_resolver="$(declare -f resolve_domain_ips_with_sources)"
+    original_probe="$(declare -f xhttp_probe_metrics)"
+    printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t50\ttrue\tdns\tready\n' > "$ROUTE_HEALTH_FILE"
+    printf '%s\t20.0.0.2\ttimeout_or_unreachable\n%s\t20.0.0.3\ttimeout_or_unreachable\n' "$future" "$future" > "$ROUTE_COOLDOWN_FILE"
+    resolve_domain_ips_with_sources() {
+        printf 'dns\t20.0.0.2\n'
+        printf 'dns\t20.0.0.3\n'
+    }
+    xhttp_probe_metrics() { fail "cooled-down route was probed unexpectedly"; }
+
+    refresh_route_candidate_health || fail "route health refresh failed when all candidates were cooled down"
+    eval "$original_resolver"
+    eval "$original_probe"
+    grep -Fq $'20.0.0.1\t200\t50\ttrue' "$ROUTE_HEALTH_FILE" \
+        || fail "route health refresh replaced the last known-good cache when every candidate was skipped"
+    grep -Fq 'skipped_all_candidates' "$LOG_FILE" || fail "skipped-all-candidates event was not logged"
+    pass "route health refresh preserves previous cache when all candidates are cooled down"
 }
 
 test_route_preference_write_failures_return_failure() {
@@ -385,6 +494,91 @@ test_usable_fallback_ips_caps_live_probe_fallback() {
     probes=$(wc -l < "$probes_file" | tr -d ' ')
     [[ "$probes" -eq 3 ]] || fail "live fallback probe path was not capped at route monitor max; got $probes"
     pass "usable fallback live probes are bounded by route monitor cap"
+}
+
+test_boot_status_helpers_record_silent_start_result() {
+    reset_runtime_paths
+    write_boot_status "route_settling" "silent_start" "Route still settling" "404" "33"
+    python -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "boot status is not valid JSON"
+    grep -Fq '"status": "route_settling"' "$BOOT_STATUS_FILE" || fail "boot status missing status"
+    boot_status_summary | grep -Fq 'route_settling' || fail "boot status summary missing status"
+    pass "boot status helpers persist readable startup state"
+}
+
+test_config_exports_write_metadata_and_subscription_url() {
+    reset_runtime_paths
+    BASE_DIR="$TMP_ROOT"
+    MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
+    SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
+    CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    XRAY_PORT=443
+    GITHUB_USER="tester"
+    git_remote_repo_slug() { printf 'owner/repo\n'; }
+    write_config_exports_from_links "vless://example-one" "vless://example-two" >/dev/null
+
+    python -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "config metadata is not valid JSON"
+    grep -Fq '"config_count": 2' "$CONFIG_META_FILE" || fail "config metadata missing count"
+    [[ "$(subscription_url)" == "https://raw.githubusercontent.com/owner/repo/main/configs-subscription-base64.txt" ]] \
+        || fail "subscription_url did not use detected GitHub repo"
+    pass "config exports write machine-readable metadata and subscription URL"
+}
+
+test_config_metadata_sanitizes_invalid_max_fallback_links() {
+    reset_runtime_paths
+    BASE_DIR="$TMP_ROOT"
+    CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    XRAY_PORT=443
+    MAX_FALLBACK_LINKS="not-a-number"
+    GITHUB_USER="tester"
+    git_remote_repo_slug() { printf 'owner/repo\n'; }
+
+    write_config_metadata 1 "abc123"
+    python -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "metadata JSON broke when max fallback links was invalid"
+    grep -Fq '"max_fallback_links": 20' "$CONFIG_META_FILE" \
+        || fail "invalid max fallback link setting was not sanitized to default 20"
+    pass "config metadata sanitizes invalid max fallback link settings"
+}
+
+test_low_overhead_mode_suppresses_info_logs() {
+    reset_runtime_paths
+    enable_low_overhead_mode
+    log_event INFO "low_overhead_info_should_skip"
+    log_event WARN "low_overhead_warn_should_stay"
+    ! grep -Fq "low_overhead_info_should_skip" "$LOG_FILE" || fail "low overhead mode did not suppress INFO logs"
+    grep -Fq "low_overhead_warn_should_stay" "$LOG_FILE" || fail "low overhead mode suppressed WARN logs"
+    disable_low_overhead_mode
+    pass "low-overhead mode suppresses nonessential INFO logs only"
+}
+
+test_low_overhead_env_can_be_overridden_by_toggle() {
+    reset_runtime_paths
+    G2RAY_LOW_OVERHEAD=1
+    low_overhead_enabled || fail "low overhead env flag did not enable mode"
+    disable_low_overhead_mode
+    if low_overhead_enabled; then
+        fail "low overhead disable toggle did not override the env flag"
+    fi
+    enable_low_overhead_mode
+    low_overhead_enabled || fail "low overhead enable toggle did not re-enable mode"
+    unset G2RAY_LOW_OVERHEAD
+    disable_low_overhead_mode
+    pass "low-overhead mode can be explicitly toggled even when env default is enabled"
+}
+
+test_performance_profile_settings_are_available() {
+    reset_runtime_paths
+    local balanced low_latency low_overhead
+    balanced="$(performance_profile_settings balanced)"
+    low_latency="$(performance_profile_settings low_latency)"
+    low_overhead="$(performance_profile_settings low_overhead)"
+    grep -Fq 'maxConcurrentUploads=16' <<< "$balanced" || fail "balanced profile missing expected concurrency"
+    grep -Fq 'maxConcurrentUploads=24' <<< "$low_latency" || fail "low_latency profile missing higher concurrency"
+    grep -Fq 'sniffQuic=false' <<< "$low_overhead" || fail "low_overhead profile should disable QUIC sniffing"
+    pass "performance profile settings are explicit and inspectable"
 }
 
 test_route_settling_history_records_summary() {
@@ -759,17 +953,29 @@ test_port_visibility_is_throttled
 test_runtime_lock_serializes_operations_and_allows_reentry
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_cached_route_order_uses_reliability_then_average_latency
+test_cached_route_order_uses_recent_weighted_score
 test_route_candidate_stats_track_average_and_success_rate
+test_route_health_records_source_reason_and_recent_average
+test_route_failure_reason_classifier
+test_xhttp_probe_metrics_reports_curl_failure_reason
 test_cached_route_order_prefers_pinned_route_then_latency_without_stats
 test_route_monitor_default_and_hard_cap_are_wide_but_bounded
 test_blacklisted_route_is_excluded_from_cached_exports
 test_manual_route_candidates_are_validated_and_resettable
+test_route_preferences_clear_matching_cooldowns
+test_route_health_refresh_preserves_cache_when_all_candidates_are_cooled_down
 test_route_preference_write_failures_return_failure
 test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source
 test_last_known_state_scans_full_current_log
 test_usable_fallback_ips_uses_fresh_cache
 test_usable_fallback_ips_caps_live_probe_fallback
+test_boot_status_helpers_record_silent_start_result
+test_config_exports_write_metadata_and_subscription_url
+test_config_metadata_sanitizes_invalid_max_fallback_links
+test_low_overhead_mode_suppresses_info_logs
+test_low_overhead_env_can_be_overridden_by_toggle
+test_performance_profile_settings_are_available
 test_route_settling_history_records_summary
 test_doctor_json_reports_probe_state
 test_doctor_json_sanitizes_invalid_port

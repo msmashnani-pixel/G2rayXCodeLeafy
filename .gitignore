@@ -4,6 +4,8 @@
 /configs-to-copy-for-mobile.txt.*
 /configs-subscription-base64.txt
 /configs-subscription-base64.txt.*
+/configs-meta.json
+/configs-meta.json.*
 /g2ray-support-*.tar.gz
 /g2ray.sh.*
 /worker/codespace-waker/.dev.vars*
