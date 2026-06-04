@@ -4,8 +4,8 @@
 
 A sleek VLESS proxy manager for GitHub Codespaces.
 
-[![Version](https://img.shields.io/badge/version-1.4.3-2DC94E?style=flat-square)](https://github.com/shayanay80atomic/G2rayXCodeLeafy)
-[![License](https://img.shields.io/badge/license-MIT-2DC94E?style=flat-square)](https://github.com/shayanay80atomic/G2rayXCodeLeafy)
+[![Version](https://img.shields.io/badge/version-1.4.3-2DC94E?style=flat-square)](#g2rayxcodeleafy)
+[![License](https://img.shields.io/badge/license-MIT-2DC94E?style=flat-square)](LICENSE)
 [![Status](https://img.shields.io/badge/status-stable-2DC94E?style=flat-square)]()
 
 </div>
@@ -54,9 +54,9 @@ The panel writes copy-ready configs and a base64 subscription file inside your C
 
 <div align="center">
 
-| 🛠️ Configuration Optimizer |
+| Private Client Import |
 | :--- |
-| To finalize your setup, take the config received from the panel and visit **[NetLeafy](https://code-leafy.github.io/NetLeafy)**. Set the server mode to **G2ray** and paste your link to generate a fully optimized connection. Pasting a VLESS link into any third-party tool shares live access details for that node; use only tools you trust, and rotate/regenerate afterward if you need to revoke access. |
+| Import the copy-ready links or the local base64 subscription file directly into your own test client. Pasting a VLESS link into any third-party tool shares live access details for that node; use only tools you trust, and rotate/regenerate afterward if you need to revoke access. |
 
 </div>
 
@@ -431,5 +431,5 @@ Codespace region affects the likely exit IP/country and latency. Set the desired
 
 > **Personal Test / Educational Purpose Only:** This project is provided for private testing, education, and research. Do not publish generated configs or operate it as a public access service. Users are solely responsible for compliance with applicable laws, platform policies, and network rules. The maintainers assume no liability for misuse.
 
-[MIT License](https://github.com/shayanay80atomic/G2rayXCodeLeafy/blob/main/LICENSE) · Based on the Code-Leafy project
+[MIT License](LICENSE) · Based on the Code-Leafy project
 </div>

@@ -1605,7 +1605,11 @@ test_docs_and_public_configs_are_consistent() {
         'Donate Config' \
         'send_to_vless_forwarder' \
         'publish-subscription' \
-        'raw.githubusercontent.com/shayanay80atomic/G2rayXCodeLeafy/main/configs.txt'
+        'raw.githubusercontent.com/shayanay80atomic/G2rayXCodeLeafy/main/configs.txt' \
+        'shayanay80atomic/G2rayXCodeLeafy' \
+        'shaunme32/G2rayXCodeLeafy' \
+        'https://code-leafy.github.io/NetLeafy' \
+        'https://t.me/CodeLeafy'
     do
         if grep_fixed "$removed" "$README" || grep_fixed "$removed" "$SCRIPT"; then
             fail "public config sharing reference remains: $removed"

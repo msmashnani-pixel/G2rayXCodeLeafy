@@ -1275,7 +1275,7 @@ test_support_bundle_redacts_sensitive_material() {
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     XRAY_PORT=443
     local uuid="11111111-2222-3333-4444-555555555555"
-    local bearer="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    local bearer="TEST_BEARER_SECRET_REDACT_ME"
     local github_token="TEST_GITHUB_TOKEN_REDACT_ME"
     local structured_token="TEST_STRUCTURED_TOKEN_REDACT_ME"
     local metadata_token="TEST_METADATA_GITHUB_TOKEN_REDACT_ME"

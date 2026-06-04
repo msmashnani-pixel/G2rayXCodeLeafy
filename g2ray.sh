@@ -9,7 +9,7 @@ detect_project_repo_default() {
     local remote url slug upstream_ref upstream_remote
     upstream_ref=$(git -C "$BASE_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
     upstream_remote="${upstream_ref%%/*}"
-    for remote in "$upstream_remote" origin shaun upstream; do
+    for remote in "$upstream_remote" origin poul shaun upstream; do
         [[ -n "$remote" && "$remote" != "$upstream_ref" ]] || continue
         url=$(git -C "$BASE_DIR" remote get-url "$remote" 2>/dev/null || true)
         [[ -n "$url" ]] || continue
@@ -20,7 +20,7 @@ detect_project_repo_default() {
             return 0
         fi
     done
-    printf 'shaunme32/G2rayXCodeLeafy\n'
+    printf 'Code-Leafy/G2rayXCodeLeafy\n'
 }
 
 PROJECT_REPO="${G2RAY_PROJECT_REPO:-$(detect_project_repo_default)}"
@@ -4246,8 +4246,9 @@ while true; do
             echo -e "  ${DIM}QR PNG files are saved under ${QR_DIR}.${NC}"
             echo -e "  ${DIM}If phone QR scanning fails, open the PNG, import the copy-ready link, or${NC}"
             echo -e "  ${DIM}${MOBILE_CONFIG_FILE} instead. Terminal zoom/theme can make QR scanning unreliable.${NC}\n"
-            echo -e "  ${DIM}For exit location details, use option 12) Server Location.${NC}\n"
-            echo -e "  ${DIM}Not working? Visit:${NC} ${GREEN}https://code-leafy.github.io/NetLeafy${NC}\n"
+            echo -e "  ${DIM}For exit location details, use option 12) Server Location.${NC}"
+            echo -e "  ${DIM}Not working? Use option 14) Diagnostics, 6) Recover Now, or${NC}"
+            echo -e "  ${DIM}run: bash ./g2ray.sh --support-bundle${NC}\n"
             echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
             ;;
         2)

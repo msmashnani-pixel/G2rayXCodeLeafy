@@ -1,1 +1,1 @@
-Make Sure To Join Our Telegram Channel : https://t.me/CodeLeafy 🍃
+Personal testing only. Keep generated configs private and local to your own Codespace.
