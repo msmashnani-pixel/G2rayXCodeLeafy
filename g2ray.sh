@@ -1364,37 +1364,6 @@ EOF
     tmux new-session -d -s g2ray_keepalive "$keepalive_cmd" 2>/dev/null || true
 }
 
-send_to_vless_forwarder() {
-    local link="$1" resp
-    local url="https://script.google.com/macros/s/AKfycbwtsJZhhaBjPILq0wY3saytWmWtQFD6aXXwmHnX_i_BX5OCMLiVrXPutCxM-ejPafVGsg/exec"
-    if ! command -v jq >/dev/null 2>&1; then
-        echo -e "  ${RED}✖ jq unavailable — cannot donate config.${NC}"
-        return 1
-    fi
-    local payload; payload=$(jq -n --arg m "$link" '{message:$m}')
-    resp=$(mktemp "${TMPDIR:-/tmp}/g2ray_donate.XXXXXX") || {
-        echo -e "  ${RED}✖ Could not prepare donation response file.${NC}"
-        return 1
-    }
-    echo -e "  ${YELLOW}Sending config to developer network...${NC}"
-    if curl -sf -L --max-time 15 -H "Content-Type: application/json" \
-            -d "$payload" "$url" </dev/null > "$resp" 2>&1; then
-        if grep -q "Appended to GitHub" "$resp"; then
-            rm -f "$resp" 2>/dev/null || true
-            echo -e "  ${GREEN}✔ Config donated successfully! Thank you.${NC}"
-            return 0
-        else
-            rm -f "$resp" 2>/dev/null || true
-            echo -e "  ${RED}✖ Donation endpoint rejected.${NC}"
-            return 1
-        fi
-    else
-        rm -f "$resp" 2>/dev/null || true
-        echo -e "  ${RED}✖ Could not reach donation endpoint.${NC}"
-        return 1
-    fi
-}
-
 is_port_open() {
     if command -v ss >/dev/null 2>&1; then
         sudo ss -tnl 2>/dev/null | grep -q ":${XRAY_PORT}[[:space:]]"
@@ -3054,37 +3023,8 @@ generate_ordered_links() {
     fi
 }
 
-git_remote_repo_slug() {
-    local remote url slug upstream_ref upstream_remote
-    upstream_ref=$(git -C "$BASE_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
-    upstream_remote="${upstream_ref%%/*}"
-    for remote in "$upstream_remote" origin shaun upstream; do
-        [[ -n "$remote" && "$remote" != "$upstream_ref" ]] || continue
-        url=$(git -C "$BASE_DIR" config --get "remote.${remote}.url" 2>/dev/null || true)
-        [[ -n "$url" ]] || continue
-        slug=$(printf '%s' "$url" | sed -nE 's#^https://github\.com/([^/]+/[^/.]+)(\.git)?$#\1#p; s#^git@github\.com:([^/]+/[^/.]+)(\.git)?$#\1#p')
-        [[ -n "$slug" ]] && { printf '%s\n' "$slug"; return 0; }
-    done
-}
-
-subscription_url() {
-    local slug branch
-    slug=$(git_remote_repo_slug || true)
-    [[ -n "$slug" ]] || slug="$PROJECT_REPO"
-    branch="${G2RAY_SUBSCRIPTION_BRANCH:-main}"
-    printf 'https://raw.githubusercontent.com/%s/%s/configs-subscription-base64.txt' "$slug" "$branch"
-}
-
-subscription_url_warning() {
-    cat >&2 <<'EOF'
-Warning: this URL is usable by VLESS clients only if the file is publicly reachable or served through a client-compatible private endpoint.
-Base64 is not encryption; publishing configs-subscription-base64.txt exposes live configs to anyone who can read the URL.
-EOF
-}
-
 write_config_metadata() {
-    local count="$1" hash="$2" sub_url generated max_links
-    sub_url=$(subscription_url)
+    local count="$1" hash="$2" generated max_links
     max_links=$(safe_max_fallback_links)
     generated=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
     cat > "$CONFIG_META_FILE" <<JSON
@@ -3098,7 +3038,7 @@ write_config_metadata() {
   "hash": "$(json_escape "$hash")",
   "mobile_config_file": "$(json_escape "$MOBILE_CONFIG_FILE")",
   "subscription_file": "$(json_escape "$SUBSCRIPTION_FILE")",
-  "subscription_url": "$(json_escape "$sub_url")",
+  "subscription_scope": "local_codespace_only",
   "performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
   "low_overhead": $(low_overhead_enabled && printf true || printf false),
   "latency_focus": $(latency_focus_enabled && printf true || printf false)
@@ -3130,42 +3070,6 @@ refresh_config_exports() {
     write_config_exports_from_links "${link_array[@]}"
 }
 
-publish_subscription_export() {
-    local consent="${1:-}" push_mode="${2:-}" subscription_rel
-    refresh_config_exports || {
-        echo "Could not refresh subscription export. Generate a config first." >&2
-        return 1
-    }
-    [[ -s "$SUBSCRIPTION_FILE" ]] || {
-        echo "Subscription export is empty. Generate a config first." >&2
-        return 1
-    }
-    if [[ "${G2RAY_PUBLISH_PUBLIC_SUBSCRIPTION:-0}" != "1" && "$consent" != "--yes" ]]; then
-        cat >&2 <<'EOF'
-Publishing configs-subscription-base64.txt exposes live VLESS credentials to anyone who can read the URL.
-Run with G2RAY_PUBLISH_PUBLIC_SUBSCRIPTION=1 or --yes only when you intentionally want a public/client-refreshable subscription.
-EOF
-        return 2
-    fi
-    command -v git >/dev/null 2>&1 || { echo "git is required to publish the subscription export." >&2; return 1; }
-    git -C "$BASE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
-        echo "This directory is not a git repository." >&2
-        return 1
-    }
-    subscription_rel="${SUBSCRIPTION_FILE#$BASE_DIR/}"
-    [[ "$subscription_rel" != "$SUBSCRIPTION_FILE" ]] || subscription_rel="$(basename "$SUBSCRIPTION_FILE")"
-    git -C "$BASE_DIR" add -f -- "$subscription_rel"
-    if git -C "$BASE_DIR" diff --cached --quiet -- "$subscription_rel"; then
-        echo "Subscription export already matches git index."
-    else
-        git -C "$BASE_DIR" commit -m "Update subscription export"
-    fi
-    if [[ "$push_mode" == "--push" || "${G2RAY_PUBLISH_SUBSCRIPTION_PUSH:-0}" == "1" ]]; then
-        git -C "$BASE_DIR" push
-    fi
-    printf 'Subscription URL: %s\n' "$(subscription_url)"
-}
-
 generate_link() {
     generate_domain_link
 }
@@ -3175,26 +3079,6 @@ generate_links_for_display() {
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     printf '%s\n' "$(generate_domain_link)"
     generate_ip_links
-}
-
-do_donate_config() {
-    check_port_visibility || return 0
-    local vless; vless=$(generate_link)
-    if [[ -z "$vless" ]]; then
-        echo -e "  ${RED}✖ No config found. Generate one first (Option 2).${NC}"
-        sleep 2; return 0
-    fi
-    refresh_screen
-    echo -e "\n  ${GREEN}● Donate Configuration${NC}"
-    echo -e "  ${WHITE}Help others connect securely for free.${NC}"
-    echo -e "  ${DIM}This shares your live VLESS link publicly.${NC}"
-    echo -e "  ${DIM}Only donate configs you intentionally want others to use.${NC}\n"
-    echo -ne "  ${GREEN}╰─❯${NC} Confirm donation? (y/n): "
-    read -r d
-    if [[ "$d" =~ ^[Yy]$ ]]; then
-        send_to_vless_forwarder "$vless" && touch "$DATA_DIR/.prompted_$(printf '%s' "$vless" | md5sum | awk '{print $1}')"
-    fi
-    sleep 2
 }
 
 log_diagnostic_snapshot() {
@@ -3258,6 +3142,7 @@ redact_sensitive_text() {
         -e "s#vless://[^[:space:]\"'{},]+#<vless-redacted>#g" \
         -e "s#(\"?authorization\"?[[:space:]]*:[[:space:]]*\"?bearer[[:space:]]+)[^\"'[:space:],}]+#\\1<bearer-redacted>#Ig" \
         -e "s#(\"?GITHUB_TOKEN\"?[[:space:]]*[:=][[:space:]]*\"?)[^\"'[:space:],}]+#\\1<github-token-redacted>#Ig" \
+        -e "s#(\"?token\"?[[:space:]]*:[[:space:]]*\"?)[^\"'[:space:],}]+#\\1<token-redacted>#Ig" \
         -e "s#(\"?WAKE_SECRET\"?[[:space:]]*[:=][[:space:]]*\"?)[^\"'[:space:],}]+#\\1<wake-secret-redacted>#Ig" \
         -e "s#(\"?wake_secret\"?[[:space:]]*[:=][[:space:]]*\"?)[^\"'[:space:],}]+#\\1<wake-secret-redacted>#Ig" \
         -e 's#github_pat_[A-Za-z0-9_]+#github_pat_<redacted>#g' \
@@ -3466,8 +3351,8 @@ show_diagnostics() {
     echo -e "  Performance profile : ${WHITE}${PERFORMANCE_PROFILE}${NC}"
     echo -e "  Low-overhead mode   : ${WHITE}$(low_overhead_summary)${NC}"
     echo -e "  Latency focus mode  : ${WHITE}$(latency_focus_summary)${NC}"
-    echo -e "  Raw subscription URL : ${WHITE}$(subscription_url)${NC}"
-    echo -e "  ${DIM}Only publish generated exports through a private repo/channel; public repos expose live credentials.${NC}"
+    echo -e "  Local subscription file : ${WHITE}${SUBSCRIPTION_FILE}${NC}"
+    echo -e "  ${DIM}Generated exports stay local in this Codespace and are ignored by git.${NC}"
 
     echo -e "\n  ${WHITE}${B}Recent G2ray Events${NC}"
     if [[ -s "$LOG_FILE" ]]; then
@@ -3964,7 +3849,6 @@ bench_json_impl() {
         refresh_route_candidate_health() { return 0; }
         background_supervisor_status() { printf 'pid=1 running=true version=ok token=present heartbeat_age=1s\n'; }
         recover_now() { return 0; }
-        git_remote_repo_slug() { printf 'owner/repo\n'; }
     fi
     for spec in \
         'config_path_cache|for _i in $(seq 1 5); do xhttp_config_path >/dev/null; done' \
@@ -4031,22 +3915,10 @@ if [[ "${1:-}" == "--bench" || "${1:-}" == "bench" ]]; then
     exit $?
 fi
 
-if [[ "${1:-}" == "--print-subscription-url" || "${1:-}" == "subscription-url" ]]; then
-    subscription_url_warning
-    subscription_url
-    printf '\n'
-    exit 0
-fi
-
 if [[ "${1:-}" == "--refresh-exports" || "${1:-}" == "--export" || "${1:-}" == "export" ]]; then
     refresh_config_exports
     printf 'Exports refreshed: %s\n' "$SUBSCRIPTION_FILE"
     exit 0
-fi
-
-if [[ "${1:-}" == "--publish-subscription" || "${1:-}" == "publish-subscription" ]]; then
-    publish_subscription_export "${2:-}" "${3:-}"
-    exit $?
 fi
 
 if [[ "${1:-}" == "--support-bundle" || "${1:-}" == "support-bundle" ]]; then
@@ -4181,7 +4053,7 @@ while true; do
     echo ""
     echo -e "  ${WHITE}${B}● SYSTEM CONFIGURATION${NC}"
     echo -e "   ${RED}7)${NC} Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))"
-    echo -e "   ${RED}8)${NC} Donate Config"
+    echo -e "   ${DIM}Generated configs stay local; do not publish live links.${NC}"
     echo -e "  ${RED}18)${NC} Toggle Low-Overhead Mode ($(echo -e "$_LOW_LABEL"))"
     echo -e "  ${RED}49)${NC} Toggle Latency Focus Mode ($(echo -e "$_LATENCY_LABEL"))"
     echo ""
@@ -4236,29 +4108,11 @@ while true; do
             _VLESS_PRIMARY="${_CONFIG_LINKS[0]:-}"
             [[ -z "$_VLESS_PRIMARY" ]] && { echo -e "  ${RED}✖ Error generating link.${NC}"; sleep 2; continue; }
             write_config_exports_from_links "${_CONFIG_LINKS[@]}" >/dev/null 2>&1 || true
-            _VHASH=$(printf '%s' "$_VLESS_PRIMARY" | md5sum | awk '{print $1}')
-            _PFLAG="$DATA_DIR/.prompted_${_VHASH}"
-            if [[ ! -f "$_PFLAG" ]]; then
-                refresh_screen
-                echo -e "  ${GREEN}🎉 Node is Ready!${NC}\n"
-                echo -e "  ${WHITE}Donate this config to help others connect freely?${NC}"
-                echo -e "  ${DIM}This shares your live VLESS link publicly.${NC}"
-                echo -e "  ${DIM}Only donate configs you intentionally want others to use.${NC}\n"
-                echo -ne "  ${GREEN}╰─❯${NC} Donate? (y/n): "
-                read -r _share
-                if [[ "$_share" =~ ^[Yy]$ ]]; then
-                    send_to_vless_forwarder "$_VLESS_PRIMARY" && touch "$_PFLAG"
-                    sleep 1
-                else
-                    touch "$_PFLAG"
-                fi
-            fi
             refresh_screen
             echo -e "  ${RED}● Configs & QR Codes${NC}"
-            echo -e "  ${DIM}Raw links are printed without color codes and saved to:${NC}"
-            echo -e "  ${DIM}Base64 subscription export:${NC} ${WHITE}${SUBSCRIPTION_FILE}${NC}"
-            echo -e "  ${DIM}Raw subscription URL:${NC} ${WHITE}$(subscription_url)${NC}"
-            echo -e "  ${DIM}Generated exports are ignored by git because public repos expose live credentials.${NC}"
+            echo -e "  ${DIM}Raw links are printed without color codes and saved locally to:${NC}"
+            echo -e "  ${DIM}Local base64 subscription file:${NC} ${WHITE}${SUBSCRIPTION_FILE}${NC}"
+            echo -e "  ${DIM}Generated exports are ignored by git and are not published through the repo.${NC}"
             echo -e "  ${WHITE}${MOBILE_CONFIG_FILE}${NC}\n"
             _INDEX=1
             _QR_MODE="${G2RAY_QR_MODE:-recommended}"
@@ -4319,7 +4173,10 @@ while true; do
             fi
             sleep 2
             ;;
-        8) do_donate_config ;;
+        8)
+            echo -e "\n  ${DIM}This old public-sharing option has been removed. Keep generated configs for personal/test use only.${NC}"
+            sleep 2
+            ;;
         9)
             refresh_screen
             read -r _TD _TU <<< "$(get_data_usage)"

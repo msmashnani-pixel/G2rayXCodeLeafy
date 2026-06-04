@@ -12,7 +12,7 @@ A sleek VLESS proxy manager for GitHub Codespaces.
 
 ---
 
-> **Educational use only:** This project is provided for educational and research purposes. Use it only in ways that comply with applicable laws, GitHub Codespaces policies, network rules, and any services you connect to. You are responsible for your own usage.
+> **Personal test and educational use only:** This project is provided for private testing, education, and research. Do not publish generated configs, run a public access service, or use it in ways that violate applicable laws, GitHub Codespaces policies, network rules, or any services you connect to. You are responsible for your own usage.
 
 ---
 
@@ -38,20 +38,6 @@ G2ray is a powerful, interactive Bash panel designed to instantly deploy and man
 
 ---
 
-<details><summary><kbd>🔗</kbd> Community Donated Configs (SUB)</summary>
-
-Want to use public nodes donated by other G2ray users? Import this raw newline-separated list into clients that support plain VLESS subscriptions:
-
-```text
-https://raw.githubusercontent.com/shayanay80atomic/G2rayXCodeLeafy/main/configs.txt
-```
-
-Community configs are public third-party endpoints. Treat them as untrusted, best-effort test nodes and do not use them for sensitive traffic. A donated VLESS link exposes live access credentials for that donor's node. Generate your own private configs for serious use.
-
-</details>
-
----
-
 ### Core Features
 
 #### ⚡ One-Click Deploy & Manage
@@ -63,8 +49,8 @@ Built-in background loops and Tmux keepalives reduce idle shutdowns while the Co
 #### 📡 Live Analytics & Quota
 Tracks real-time RX/TX traffic and resource usage (CPU/RAM). The quota panel is a local 2-core wall-clock estimate that resets by month; GitHub billing remains authoritative. GitHub's 15 GB-month allowance is storage quota, not traffic quota.
 
-#### 📦 Community Config Network
-Donate your generated config directly from the CLI to share access with the community. Donation shares the live VLESS link, including its UUID, Codespaces endpoint, and link label, so only donate configs you intentionally want public.
+#### 📦 Private Local Exports
+The panel writes copy-ready configs and a base64 subscription file inside your Codespace only. These generated files are ignored by git because they contain live connection credentials. Use them for your own devices and private tests; do not commit, publish, or share them as a public subscription.
 
 <div align="center">
 
@@ -216,7 +202,6 @@ bash ./g2ray.sh status
 bash ./g2ray.sh start
 bash ./g2ray.sh export
 bash ./g2ray.sh --support-bundle
-bash ./g2ray.sh --print-subscription-url
 bash ./g2ray.sh latency-focus on
 bash ./g2ray.sh bench --json --mock
 ```
@@ -229,15 +214,7 @@ bash ./g2ray.sh bench --json --mock
 
 `--support-bundle` creates a redacted `.tar.gz` support bundle under `logs/`. It includes doctor JSON, diagnostics, structured event logs, route health, rolling route stats, route-settling history, and Xray logs while redacting VLESS links, UUIDs, bearer tokens, GitHub tokens, and wake secrets.
 
-`--print-subscription-url` prints the raw-GitHub URL where `configs-subscription-base64.txt` would be available if you publish that export yourself. Generated config exports are ignored by default because they contain live VLESS credentials; the base64 subscription is encoding, not encryption. Most VLESS clients cannot authenticate to a private GitHub raw URL, so a subscription URL is directly usable only when the file is publicly reachable or served through a client-compatible private endpoint. Prefer local/private distribution; if you intentionally publish a public subscription, rotate the UUID afterward when you want to revoke access, and do not publish `configs-to-copy-for-mobile.txt` or `configs-meta.json`.
-
-Dangerous public subscription publishing, only when you intentionally want public access:
-
-```bash
-bash ./g2ray.sh publish-subscription --yes --push
-```
-
-`publish-subscription --yes --push` is an explicit opt-in helper for clients that need one subscription URL they can refresh. It refreshes exports, force-stages only `configs-subscription-base64.txt`, commits it, pushes when `--push` is provided, then prints the same raw-GitHub subscription URL. Use it only when you intentionally want that repository/branch to expose the live configs; anyone who can read that URL can import them. To revoke a published subscription, generate a new config/UUID and publish again, or remove the file from the branch.
+`export` refreshes local helper files in the Codespace: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `data/configs-meta.json`. These files are for your own devices and private tests only. The base64 subscription is encoding, not encryption, and generated exports are git-ignored because they contain live credentials.
 
 After `git pull`, reattach the panel or run:
 
@@ -258,7 +235,7 @@ Option `18) Toggle Low-Overhead Mode` reduces INFO-level app logging and slows l
 
 Option `49) Toggle Latency Focus Mode` is more aggressive than low-overhead mode. It keeps heartbeat, session accounting, and self-heal alive, but suppresses non-error app logs and skips noncritical background route/export/message refreshes while the mode is active. Use it briefly while measuring client latency; turn it off before collecting support logs or expecting automatic export updates.
 
-The config screen writes three local export helpers: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `configs-meta.json`. They are ignored by git by default because they include live connection credentials or metadata. Use them locally, or distribute them through a private channel you control. A raw-GitHub subscription URL is shown only as a convenience for publicly reachable subscriptions or advanced users who provide a client-compatible private endpoint; a public repo makes the subscription public.
+The config screen writes three local export helpers: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `data/configs-meta.json`. They are ignored by git by default because they include live connection credentials or metadata. Use them locally inside the Codespace, or copy them only through a private channel you control. This project intentionally does not publish a raw GitHub subscription URL.
 
 On first setup, the panel shows a small recovery card so you can copy these recovery commands safely: `bash ./g2ray.sh --doctor-json`, `bash ./g2ray.sh --recover-now`, `bash ./g2ray.sh --recover-now --json`, `bash ./g2ray.sh --support-bundle`, and, when a Worker is configured, a curl template using `Authorization: Bearer <WAKE_SECRET>`. The raw wake secret is never printed from saved metadata.
 
@@ -363,7 +340,9 @@ G2rayXCodeLeafy/
 ├── data/                    # Dynamic storage for usage stats, UUIDs, & config
 ├── logs/                    # Xray engine error logs
 ├── assets/                  # Media resources (previews & videos)
-├── configs.txt              # Community donated subscription configs
+├── scripts/                 # Codespaces start helpers
+├── tests/                   # Static, behavior, and Worker regression tests
+├── worker/                  # Optional Cloudflare Codespace waker
 └── g2ray.sh                 # The main interactive panel script
 ```
 
@@ -392,7 +371,7 @@ Codespace region affects the likely exit IP/country and latency. Set the desired
 
 <div align="center">
 
-> **Educational Purpose Only:** This project is provided for educational and research purposes. Users are solely responsible for compliance with applicable laws, platform policies, and network rules. The maintainers assume no liability for misuse.
+> **Personal Test / Educational Purpose Only:** This project is provided for private testing, education, and research. Do not publish generated configs or operate it as a public access service. Users are solely responsible for compliance with applicable laws, platform policies, and network rules. The maintainers assume no liability for misuse.
 
 [MIT License](https://github.com/shayanay80atomic/G2rayXCodeLeafy/blob/main/LICENSE) · Based on the Code-Leafy project
 </div>

@@ -1,10 +1,10 @@
 # G2ray Codespace Waker
 
-Educational use only: this helper is provided for learning and recovery experiments. Use it only in ways that comply with applicable laws, GitHub Codespaces policies, Cloudflare policies, and network rules.
+Personal test and educational use only: this helper is provided for private recovery experiments and learning. Do not use it to publish generated configs or operate a public access service. Use it only in ways that comply with applicable laws, GitHub Codespaces policies, Cloudflare policies, and network rules.
 
 This Cloudflare Worker gives you a manual wake page for one GitHub Codespace through GitHub's official Codespaces API. The `GET /wake` page is public so it can load in your browser, but `POST /wake` and the `/api/*` actions require your wake secret.
 
-It does not keep the Codespace alive forever and it cannot bypass quota, billing, deletion, or account restrictions.
+It does not expose VLESS configs, keep the Codespace alive forever, or bypass quota, billing, deletion, or account restrictions.
 
 The browser page is a small mobile-friendly health dashboard. It has a large **Start Codespace** button, a **Check Health** action, route latency/status cards, copyable status text, a stop-polling button, a route history summary, a latency trend, and auto-refresh while the route is still settling.
 

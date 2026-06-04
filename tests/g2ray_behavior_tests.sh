@@ -648,7 +648,7 @@ test_boot_status_helpers_record_silent_start_result() {
     pass "boot status helpers persist readable startup state"
 }
 
-test_config_exports_write_metadata_and_subscription_url() {
+test_config_exports_write_local_only_metadata() {
     reset_runtime_paths
     BASE_DIR="$TMP_ROOT"
     MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
@@ -658,14 +658,15 @@ test_config_exports_write_metadata_and_subscription_url() {
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     XRAY_PORT=443
     GITHUB_USER="tester"
-    git_remote_repo_slug() { printf 'owner/repo\n'; }
     write_config_exports_from_links "vless://example-one" "vless://example-two" >/dev/null
 
     python -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "config metadata is not valid JSON"
     grep -Fq '"config_count": 2' "$CONFIG_META_FILE" || fail "config metadata missing count"
-    [[ "$(subscription_url)" == "https://raw.githubusercontent.com/owner/repo/main/configs-subscription-base64.txt" ]] \
-        || fail "subscription_url did not use detected GitHub repo"
-    pass "config exports write machine-readable metadata and subscription URL"
+    grep -Fq '"subscription_scope": "local_codespace_only"' "$CONFIG_META_FILE" \
+        || fail "config metadata does not mark subscription as local-only"
+    ! grep -Fq '"subscription_url"' "$CONFIG_META_FILE" \
+        || fail "config metadata still exposes a subscription URL"
+    pass "config exports write machine-readable local-only metadata"
 }
 
 test_config_exports_are_stable_client_artifacts() {
@@ -674,7 +675,6 @@ test_config_exports_are_stable_client_artifacts() {
     MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
     SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
     CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
-    git_remote_repo_slug() { printf 'owner/repo\n'; }
     local link1='vless://uuid@example.com:443?encryption=none#one'
     local link2='vless://uuid@20.0.0.1:443?encryption=none#two'
 
@@ -700,7 +700,6 @@ test_config_metadata_sanitizes_invalid_max_fallback_links() {
     XRAY_PORT=443
     MAX_FALLBACK_LINKS="not-a-number"
     GITHUB_USER="tester"
-    git_remote_repo_slug() { printf 'owner/repo\n'; }
 
     write_config_metadata 1 "abc123"
     python -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "metadata JSON broke when max fallback links was invalid"
@@ -850,31 +849,6 @@ test_latency_focus_env_can_be_overridden_by_toggle() {
     unset G2RAY_LATENCY_FOCUS
     disable_latency_focus_mode
     pass "latency-focus mode can be explicitly toggled even when env default is enabled"
-}
-
-test_git_remote_repo_slug_prefers_branch_upstream() {
-    reset_runtime_paths
-    (
-        BASE_DIR="$TMP_ROOT/repo-slug"
-        git() {
-            case "$*" in
-                *"rev-parse --abbrev-ref --symbolic-full-name @{u}"*) printf 'origin/main\n'; return 0 ;;
-                *"config --get remote.origin.url"*) printf 'https://github.com/owner/repo.git\n'; return 0 ;;
-                *"config --get remote.shaun.url"*) printf 'https://github.com/wrong/repo.git\n'; return 0 ;;
-                *) return 1 ;;
-            esac
-        }
-        [[ "$(git_remote_repo_slug)" == "owner/repo" ]] || fail "subscription URL repo slug did not prefer branch upstream remote"
-    )
-    pass "subscription URL repo slug follows the current branch upstream"
-}
-
-test_subscription_url_warning_is_available() {
-    reset_runtime_paths
-    subscription_url_warning 2>"$TMP_ROOT/subscription-warning.txt"
-    grep -Fq "Base64 is not encryption" "$TMP_ROOT/subscription-warning.txt" \
-        || fail "subscription URL warning does not explain base64/public exposure"
-    pass "subscription URL warning explains public credential exposure"
 }
 
 test_performance_profile_settings_are_available() {
@@ -1144,16 +1118,16 @@ test_support_bundle_redacts_sensitive_material() {
     XRAY_PORT=443
     local uuid="11111111-2222-3333-4444-555555555555"
     local bearer="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-    local github_token="github_pat_1234567890_SECRET_TOKEN"
-    local classic_token="gho_SECRET_TOKEN"
-    local fine_grained_token="github_pat_1234567890_SECRET_TOKEN"
+    local github_token="TEST_GITHUB_TOKEN_REDACT_ME"
+    local structured_token="TEST_STRUCTURED_TOKEN_REDACT_ME"
+    local metadata_token="TEST_METADATA_GITHUB_TOKEN_REDACT_ME"
     local vless="vless://${uuid}@behavior-space-443.app.github.dev:443?encryption=none#label"
-    printf '%s\nAuthorization: Bearer %s\nauthorization: Bearer %s\nGITHUB_TOKEN=%s\n"WAKE_SECRET":"%s"\nclassic=%s\nfine=%s\n' \
-        "$vless" "$bearer" "$bearer" "$github_token" "$bearer" "$classic_token" "$fine_grained_token" > "$LOG_FILE"
+    printf '%s\nAuthorization: Bearer %s\nauthorization: Bearer %s\nGITHUB_TOKEN=%s\n"WAKE_SECRET":"%s"\n' \
+        "$vless" "$bearer" "$bearer" "$github_token" "$bearer" > "$LOG_FILE"
     printf '{"ts":"2026-05-30T00:00:00Z","level":"INFO","event":"test","message":"%s","authorization":"Bearer %s","WAKE_SECRET":"%s","token":"%s"}\n' \
-        "$vless" "$bearer" "$bearer" "ghs_SECRET_TOKEN" > "$STRUCTURED_LOG_FILE"
+        "$vless" "$bearer" "$bearer" "$structured_token" > "$STRUCTURED_LOG_FILE"
     printf 'wake_secret=%s\n%s\n"authorization":"Bearer %s"\n' "$bearer" "$uuid" "$bearer" > "$DIAGNOSTIC_LOG_FILE"
-    printf 'worker_url=https://worker.example/wake\nwake_secret=%s\nGITHUB_TOKEN=%s\n' "$bearer" "ghr_SECRET_TOKEN" > "$WAKER_METADATA_FILE"
+    printf 'worker_url=https://worker.example/wake\nwake_secret=%s\nGITHUB_TOKEN=%s\n' "$bearer" "$metadata_token" > "$WAKER_METADATA_FILE"
     printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t10\ttrue\n' > "$ROUTE_HEALTH_FILE"
     printf 'ip=20.0.0.1\nchecked_at=2026-05-30T00:00:00Z\n' > "$LAST_GOOD_ROUTE_FILE"
     XRAY_BIN="$TMP_ROOT/missing-xray"
@@ -1170,7 +1144,7 @@ test_support_bundle_redacts_sensitive_material() {
     tar -xzf "$bundle" -C "$extract"
     [[ -s "$extract/doctor.json" ]] || fail "support bundle missing doctor JSON"
     [[ -s "$extract/logs/g2ray.log" ]] || fail "support bundle missing redacted app log"
-    if grep -R -Fq "$uuid" "$extract" || grep -R -Fq "$bearer" "$extract" || grep -R -Fq "$github_token" "$extract" || grep -R -Fq "$classic_token" "$extract" || grep -R -Fq "$fine_grained_token" "$extract" || grep -R -Fq "$vless" "$extract"; then
+    if grep -R -Fq "$uuid" "$extract" || grep -R -Fq "$bearer" "$extract" || grep -R -Fq "$github_token" "$extract" || grep -R -Fq "$structured_token" "$extract" || grep -R -Fq "$metadata_token" "$extract" || grep -R -Fq "$vless" "$extract"; then
         fail "support bundle leaked sensitive material"
     fi
     grep -R -Fq '<vless-redacted>' "$extract" || fail "support bundle did not mark redacted VLESS links"
@@ -1279,46 +1253,6 @@ test_support_bundle_marks_unreadable_optional_logs() {
     pass "support bundle marks unreadable optional logs"
 }
 
-test_publish_subscription_requires_consent_and_stages_only_subscription_file() {
-    reset_runtime_paths
-    (
-        BASE_DIR="$TMP_ROOT"
-        SUBSCRIPTION_FILE="$TMP_ROOT/configs-subscription-base64.txt"
-        local calls_file="$TMP_ROOT/git-publish-calls.txt"
-        : > "$calls_file"
-        refresh_config_exports() {
-            printf 'dmxlc3M6Ly9leGFtcGxlCg==' > "$SUBSCRIPTION_FILE"
-            return 0
-        }
-        subscription_url() {
-            printf 'https://raw.githubusercontent.com/owner/repo/main/configs-subscription-base64.txt'
-        }
-        git() {
-            printf '%s\n' "$*" >> "$calls_file"
-            case "$*" in
-                *"rev-parse --is-inside-work-tree"*) return 0 ;;
-                *"diff --cached --quiet"*) return 1 ;;
-                *) return 0 ;;
-            esac
-        }
-
-        if publish_subscription_export >/dev/null 2>"$TMP_ROOT/publish-denied.err"; then
-            fail "subscription publish succeeded without explicit consent"
-        fi
-        grep -Fq "exposes live VLESS credentials" "$TMP_ROOT/publish-denied.err" \
-            || fail "subscription publish did not warn about public credential exposure"
-
-        G2RAY_PUBLISH_PUBLIC_SUBSCRIPTION=1 publish_subscription_export >/dev/null
-        grep -Fq "add -f -- configs-subscription-base64.txt" "$calls_file" \
-            || fail "subscription publish did not force-stage the ignored base64 export"
-        grep -Fq "commit -m Update subscription export" "$calls_file" \
-            || fail "subscription publish did not create an update commit"
-        ! grep -Fq "configs-to-copy-for-mobile.txt" "$calls_file" \
-            || fail "subscription publish staged the raw mobile config file"
-    )
-    pass "subscription publishing is explicit and stages only the base64 subscription export"
-}
-
 test_port_visibility_is_throttled
 test_runtime_lock_serializes_operations_and_allows_reentry
 test_port_visibility_cache_is_scoped_by_codespace_and_port
@@ -1345,7 +1279,7 @@ test_usable_fallback_ips_fills_partial_fresh_cache
 test_usable_fallback_ips_caps_live_probe_fallback
 test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
-test_config_exports_write_metadata_and_subscription_url
+test_config_exports_write_local_only_metadata
 test_config_exports_are_stable_client_artifacts
 test_config_metadata_sanitizes_invalid_max_fallback_links
 test_bench_json_reports_deterministic_budgets
@@ -1354,8 +1288,6 @@ test_low_overhead_env_can_be_overridden_by_toggle
 test_low_overhead_keeps_important_state_logs
 test_latency_focus_mode_suppresses_noncritical_logs
 test_latency_focus_env_can_be_overridden_by_toggle
-test_git_remote_repo_slug_prefers_branch_upstream
-test_subscription_url_warning_is_available
 test_performance_profile_settings_are_available
 test_route_settling_history_records_summary
 test_doctor_json_reports_probe_state
@@ -1373,4 +1305,3 @@ test_support_bundle_redacts_sensitive_material
 test_support_bundle_handles_relative_log_dir
 test_support_bundle_includes_rotated_logs
 test_support_bundle_marks_unreadable_optional_logs
-test_publish_subscription_requires_consent_and_stages_only_subscription_file

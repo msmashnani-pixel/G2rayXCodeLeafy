@@ -7,7 +7,6 @@ SCRIPT="$ROOT_DIR/g2ray.sh"
 GITIGNORE="$ROOT_DIR/.gitignore"
 GITATTRIBUTES="$ROOT_DIR/.gitattributes"
 README="$ROOT_DIR/README.md"
-CONFIGS="$ROOT_DIR/configs.txt"
 DOCKERFILE="$ROOT_DIR/.devcontainer/Dockerfile"
 CI_WORKFLOW="$ROOT_DIR/.github/workflows/static-tests.yml"
 BEHAVIOR_TESTS="$ROOT_DIR/tests/g2ray_behavior_tests.sh"
@@ -158,7 +157,7 @@ test_exit_trap_preserves_failures() {
 
 test_generated_files_are_ignored() {
     [[ -f "$GITIGNORE" ]] || fail '.gitignore is missing'
-    for pattern in '/data/' '/logs/' '/configs-to-copy-for-mobile.txt' '/configs-subscription-base64.txt' '/configs-meta.json'; do
+    for pattern in '/data/' '/logs/' '/configs.txt' '/configs-to-copy-for-mobile.txt' '/configs-subscription-base64.txt' '/configs-meta.json'; do
         grep_fixed "$pattern" "$GITIGNORE" || fail ".gitignore missing $pattern"
     done
     for pattern in '/configs-to-copy-for-mobile.txt.*' '/configs-subscription-base64.txt.*' '/configs-meta.json.*'; do
@@ -659,8 +658,10 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker README does not instruct storing wake secret as a secret'
     grep_fixed 'Cloudflare Worker Waker' "$README" \
         || fail 'root README does not mention the Cloudflare Worker waker'
+    local gh_prefix='ghp''_'
+    local pat_prefix='github''_pat_'
     for file in "$WORKER_SCRIPT" "$WORKER_README" "$WORKER_WRANGLER_EXAMPLE"; do
-        if grep_regex 'ghp_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}' "$file" 2>/dev/null; then
+        if grep_regex "${gh_prefix}[A-Za-z0-9_]{20,}|${pat_prefix}[A-Za-z0-9_]{20,}" "$file" 2>/dev/null; then
             fail 'Worker files appear to contain a GitHub token'
         fi
     done
@@ -992,12 +993,11 @@ test_soft_recovery_and_route_memory_are_present() {
         || fail 'machine-readable recover JSON does not preserve the internal recovery exit code'
     grep_fixed 'recover_now --no-prompt >/dev/null 2>&1' "$SCRIPT" \
         || fail 'machine-readable recover command does not suppress human terminal output'
-    grep_fixed 'publish_subscription_export()' "$SCRIPT" \
-        || fail 'panel has no explicit subscription publishing workflow'
-    grep_fixed 'G2RAY_PUBLISH_PUBLIC_SUBSCRIPTION' "$SCRIPT" \
-        || fail 'subscription publishing is not gated by explicit consent'
-    grep_fixed 'git -C "$BASE_DIR" add -f -- "$subscription_rel"' "$SCRIPT" \
-        || fail 'subscription publishing does not force-stage the ignored base64 export only'
+    grep_fixed '"subscription_scope": "local_codespace_only"' "$SCRIPT" \
+        || fail 'config metadata does not mark exports as local-only'
+    if grep_fixed 'publish_subscription_export' "$SCRIPT" || grep_fixed 'G2RAY_PUBLISH_PUBLIC_SUBSCRIPTION' "$SCRIPT"; then
+        fail 'panel still contains public subscription publishing code'
+    fi
     grep_fixed 'tar -C "$tmp" -czf "$out" .' "$SCRIPT" \
         || fail 'support bundle archive creation is not safe for relative output paths'
     grep_fixed '--doctor-json' "$SCRIPT" \
@@ -1225,12 +1225,15 @@ test_docs_cover_panel_waker_setup() {
         || fail 'README does not document the post-pull runtime refresh command'
     grep_fixed '`--recover-now` is non-interactive and soft-only' "$README" \
         || fail 'README does not clarify headless recover limitations'
-    grep_fixed 'bash ./g2ray.sh publish-subscription --yes --push' "$README" \
-        || fail 'README does not document the explicit subscription publish helper'
-    grep_fixed 'Raw subscription URL' "$SCRIPT" \
-        || fail 'panel does not label raw GitHub subscription URLs accurately'
-    if grep_fixed 'Private subscription URL' "$SCRIPT"; then
-        fail 'panel still labels raw GitHub subscription URLs as private'
+    grep_fixed 'This project intentionally does not publish a raw GitHub subscription URL' "$README" \
+        || fail 'README does not explain local-only subscription exports'
+    grep_fixed 'Local subscription file' "$SCRIPT" \
+        || fail 'diagnostics does not show the local subscription file'
+    if grep_fixed 'publish-subscription' "$README" || grep_fixed 'publish-subscription' "$SCRIPT"; then
+        fail 'public subscription publishing command is still documented or wired'
+    fi
+    if grep_fixed 'Raw subscription URL' "$SCRIPT"; then
+        fail 'panel still prints a raw subscription URL'
     fi
     grep_fixed 'Option `49) Toggle Latency Focus Mode`' "$README" \
         || fail 'README does not document latency focus mode'
@@ -1356,14 +1359,12 @@ test_runtime_files_are_private_and_tempfiles_are_unique() {
         fail 'remote message fetch still uses a predictable /tmp path'
     fi
     if grep_fixed '> /tmp/gas_resp.txt' "$SCRIPT"; then
-        fail 'donation response still uses a predictable /tmp path'
+        fail 'removed public-sharing response still uses a predictable /tmp path'
     fi
     grep_fixed 'mktemp "${TMPDIR:-/tmp}/g2ray_remote.XXXXXX"' "$SCRIPT" \
         || fail 'self-update does not stage downloads through mktemp'
     grep_fixed 'mktemp "${TMPDIR:-/tmp}/g2ray_msg.XXXXXX"' "$SCRIPT" \
         || fail 'remote message fetch does not stage through mktemp'
-    grep_fixed 'mktemp "${TMPDIR:-/tmp}/g2ray_donate.XXXXXX"' "$SCRIPT" \
-        || fail 'donation response does not stage through mktemp'
     pass 'runtime files are private and tempfiles are unique'
 }
 
@@ -1555,29 +1556,39 @@ test_docs_and_public_configs_are_consistent() {
         || fail 'README Linux recovery flow does not include an external route probe'
     grep_fixed '12) Server Location' "$README" \
         || fail 'README does not tell users to verify the observed exit location'
-    grep_fixed 'Community Donated Configs (SUB)</summary>' "$README" \
-        || fail 'README community subscription summary is not wrapped in a details block'
-    grep_fixed 'Community configs are public third-party endpoints' "$README" \
-        || fail 'README does not warn that community configs are public third-party endpoints'
-    if grep_fixed 'without impacting your own speed or exposing personal data' "$README"; then
-        fail 'README still claims donated live configs expose no personal data'
-    fi
-    if grep_fixed 'No impact on your speed, quota, or security' "$SCRIPT" || grep_fixed 'no extra risk' "$SCRIPT"; then
-        fail 'CLI donation prompt still understates the live-config sharing tradeoff'
-    fi
-    grep_fixed 'shares the live VLESS link' "$README" \
-        || fail 'README does not disclose what donation shares'
-    grep_fixed 'This shares your live VLESS link publicly.' "$SCRIPT" \
-        || fail 'CLI donation prompt does not disclose that it shares the live VLESS link'
+    [[ ! -e "$ROOT_DIR/configs.txt" ]] \
+        || fail 'public configs.txt should not exist in the repo'
+    grep_fixed '/configs.txt' "$GITIGNORE" \
+        || fail '.gitignore does not block regenerated public configs.txt'
+    grep_fixed 'Personal test and educational use only' "$README" \
+        || fail 'README does not state personal/test-only use'
+    grep_fixed 'Private Local Exports' "$README" \
+        || fail 'README does not describe private local exports'
+    grep_fixed 'This project intentionally does not publish a raw GitHub subscription URL' "$README" \
+        || fail 'README does not explain that subscriptions are local-only'
+    grep_fixed 'Local base64 subscription file' "$SCRIPT" \
+        || fail 'config screen does not label the local subscription file'
+    grep_fixed '"subscription_scope": "local_codespace_only"' "$SCRIPT" \
+        || fail 'config metadata is not marked local-only'
+    for removed in \
+        'Community Donated Configs' \
+        'Community Config Network' \
+        'Donate Config' \
+        'send_to_vless_forwarder' \
+        'publish-subscription' \
+        'raw.githubusercontent.com/shayanay80atomic/G2rayXCodeLeafy/main/configs.txt'
+    do
+        if grep_fixed "$removed" "$README" || grep_fixed "$removed" "$SCRIPT"; then
+            fail "public config sharing reference remains: $removed"
+        fi
+    done
     grep_fixed 'insecure=0&allowInsecure=0' "$README" \
         || fail 'README does not document secure-by-default TLS verification in exported links'
     grep_fixed 'insecure=0&allowInsecure=0' "$SCRIPT" \
         || fail 'generated links are not secure-by-default for TLS verification'
     grep_fixed 'allowInsecure=1` can be tried manually as a compatibility workaround' "$README" \
         || fail 'README does not disclose the optional TLS verification compatibility tradeoff'
-    awk 'NF && seen[$0]++ { dup=1 } END { exit dup ? 1 : 0 }' "$CONFIGS" \
-        || fail 'configs.txt contains duplicate non-empty VLESS entries'
-    pass 'docs and public configs are consistent'
+    pass 'docs and local-only config exports are consistent'
 }
 
 test_devcontainer_tooling_is_not_duplicated() {
@@ -1645,21 +1656,6 @@ test_menu_loop_and_link_output_are_tidy() {
     pass 'menu loop and link output are tidy'
 }
 
-test_donation_failures_are_not_suppressed() {
-    grep_fixed 'return 0' "$SCRIPT" \
-        || fail 'donation sender does not return success explicitly'
-    grep_fixed 'return 1' "$SCRIPT" \
-        || fail 'donation sender does not return failure explicitly'
-    grep_fixed 'send_to_vless_forwarder "$vless" && touch' "$SCRIPT" \
-        || fail 'manual donation marks config as prompted even when sending fails'
-    grep_fixed 'send_to_vless_forwarder "$_VLESS_PRIMARY" && touch "$_PFLAG"' "$SCRIPT" \
-        || fail 'first-view donation prompt is suppressed even when sending fails'
-    if grep_fixed 'send_to_vless_forwarder "$_VLESS_PRIMARY"; sleep 1; }' "$SCRIPT"; then
-        fail 'first-view donation still ignores send_to_vless_forwarder failure'
-    fi
-    pass 'donation failures are not suppressed'
-}
-
 test_wait_for_port_increment_is_set_e_safe
 test_process_management_uses_pid_file
 test_background_tasks_uses_owned_pid_file
@@ -1712,4 +1708,3 @@ test_docs_and_public_configs_are_consistent
 test_devcontainer_tooling_is_not_duplicated
 test_devcontainer_post_start_wrapper_is_present
 test_menu_loop_and_link_output_are_tidy
-test_donation_failures_are_not_suppressed

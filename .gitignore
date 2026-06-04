@@ -1,5 +1,6 @@
 /data/
 /logs/
+/configs.txt
 /configs-to-copy-for-mobile.txt
 /configs-to-copy-for-mobile.txt.*
 /configs-subscription-base64.txt
