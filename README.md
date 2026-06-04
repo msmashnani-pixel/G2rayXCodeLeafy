@@ -110,7 +110,7 @@ Run one-off checks without opening the panel:
 
 ```bash
 gh codespace ssh -c <CODESPACE_NAME> -- \
-  "cd /workspaces/G2rayXCodeLeafy && bash ./g2ray.sh --doctor-json"
+  'bash -lc '\''cd "$(find /workspaces -maxdepth 2 -name g2ray.sh -printf "%h\n" | head -n1)" && bash ./g2ray.sh --doctor-json'\'''
 ```
 
 If your network blocks direct Codespaces access, run the GitHub CLI through your local SOCKS proxy before calling `gh`.
@@ -258,6 +258,19 @@ bash ./g2ray.sh bench --json --mock
 
 `export` refreshes local helper files in the Codespace: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `data/configs-meta.json`. These files are for your own devices and private tests only. The base64 subscription is encoding, not encryption, and generated exports are git-ignored because they contain live credentials.
 
+Local verification commands:
+
+```bash
+bash -n ./g2ray.sh ./scripts/post-start.sh ./tests/g2ray_static_tests.sh ./tests/g2ray_behavior_tests.sh
+bash ./tests/g2ray_static_tests.sh
+bash ./tests/g2ray_behavior_tests.sh
+bash ./g2ray.sh bench --json --mock
+cd worker/codespace-waker
+npm ci
+npm run check
+npm test
+```
+
 After `git pull`, reattach the panel or run:
 
 ```bash
@@ -327,12 +340,15 @@ Quick setup:
 
 ```bash
 cd worker/codespace-waker
+npm ci
 cp wrangler.toml.example wrangler.toml
 # edit wrangler.toml and set CODESPACE_NAME
-npx wrangler secret put GITHUB_TOKEN
-npx wrangler secret put WAKE_SECRET
-npx wrangler deploy
+npx --no-install wrangler secret put GITHUB_TOKEN
+npx --no-install wrangler secret put WAKE_SECRET
+npm run deploy
 ```
+
+The Codespace devcontainer installs Node.js 22 for current Wrangler. If you deploy from your laptop instead, use Node.js 22 or newer and run `npm ci` in `worker/codespace-waker` so Wrangler comes from the pinned local package, not from a floating global install.
 
 After deploy, copy the Worker URL that Wrangler prints, return to panel option `15) Recovery / Waker Setup`, answer that the Worker is deployed, paste the Worker URL, and run the panel's Worker test. This saves only non-sensitive Worker metadata locally so diagnostics and the recovery card can show the configured Worker.
 

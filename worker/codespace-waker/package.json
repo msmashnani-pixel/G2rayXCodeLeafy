@@ -3,6 +3,11 @@
   "type": "module",
   "scripts": {
     "check": "node --check src/index.js",
-    "test": "node ../../tests/worker_behavior_tests.mjs"
+    "test": "node ../../tests/worker_behavior_tests.mjs",
+    "dry-run": "wrangler deploy --dry-run --outdir .wrangler/dry-run",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.97.0"
   }
 }

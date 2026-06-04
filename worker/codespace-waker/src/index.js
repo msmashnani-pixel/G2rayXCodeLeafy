@@ -667,8 +667,9 @@ function withSurvivalFields(data, env) {
     survival_next_action: survivalNextAction
   };
   if (quotaBlocked) {
+    next.route_checked = false;
     next.route_ready = false;
-    if (!("route_probe" in next)) next.route_probe = null;
+    next.route_probe = null;
     next.next_action = survivalNextAction;
   }
   return next;
@@ -976,7 +977,15 @@ async function recordQuotaIncident(env, event, data) {
       if (event.kind === "health" || event.kind === "cron_health") {
         incident.last_successful_health_at = nowIso;
       }
-      if (event.kind === "wake" || event.kind === "cron_wake" || data.route_ready === true) {
+      const isWakeRecovery = event.kind === "wake" || event.kind === "cron_wake";
+      const resetMs = Date.parse(incident.quota_reset_estimate_utc || "");
+      const nowMs = Date.parse(nowIso);
+      const resetHasPassed = !Number.isFinite(resetMs) || (Number.isFinite(nowMs) && nowMs >= resetMs);
+      const isPostResetRouteReadyHealth =
+        (event.kind === "health" || event.kind === "cron_health") &&
+        data.route_ready === true &&
+        resetHasPassed;
+      if (isWakeRecovery || isPostResetRouteReadyHealth) {
         incident.quota_drought_active = false;
       } else if (incident.quota_drought_active !== true) {
         incident.quota_drought_active = false;
@@ -1860,6 +1869,7 @@ function routeSettlingFailureText(data, route, routeReady) {
 function renderHistory(data) {
   historyList.innerHTML = "";
   latencyTrend.innerHTML = "";
+  historySummary.innerHTML = "";
   if (data && data.ok === false) {
     const message = data.reason || data.error || (data.status ? "HTTP " + data.status : "history_request_failed");
     historyNote.textContent = "History request failed: " + message;
@@ -1897,7 +1907,6 @@ function renderHistory(data) {
 
 function renderHistorySummary(events, quotaIncident) {
   const summary = summarizeHistory(events);
-  historySummary.innerHTML = "";
   const cards = [
     ["Samples", String(summary.samples)],
     ["Route ready", summary.ready + " / " + summary.routeSamples],
@@ -1934,7 +1943,7 @@ function summarizeHistory(events) {
     lastStuck: ""
   };
   for (const event of events) {
-    const routeChecked = event.route_checked !== false && event.route_ready !== null;
+    const routeChecked = event.route_checked === true && event.route_ready !== null && event.route_ready !== undefined;
     if (routeChecked) {
       summary.routeSamples += 1;
       if (event.route_ready === true) summary.ready += 1;

@@ -35,12 +35,14 @@ Do not paste the GitHub token into G2ray. Put the token directly into Cloudflare
 
 ## 2. Configure Wrangler
 
-Install or use Wrangler:
+Install the pinned local Wrangler package:
 
 ```bash
-npm create cloudflare@latest -- --help
-npx wrangler --version
+npm ci
+npx --no-install wrangler --version
 ```
+
+The Codespace devcontainer installs Node.js 22 for current Wrangler. If you deploy from another machine, use Node.js 22 or newer, run `npm ci`, and use the local `npx --no-install wrangler ...` commands below.
 
 Copy the example config:
 
@@ -95,8 +97,8 @@ PowerShell:
 Store secrets in Cloudflare:
 
 ```bash
-npx wrangler secret put GITHUB_TOKEN
-npx wrangler secret put WAKE_SECRET
+npx --no-install wrangler secret put GITHUB_TOKEN
+npx --no-install wrangler secret put WAKE_SECRET
 ```
 
 Paste the GitHub token for `GITHUB_TOKEN`.
@@ -107,7 +109,7 @@ In the Cloudflare dashboard, add both `GITHUB_TOKEN` and `WAKE_SECRET` as **Secr
 ## 4. Deploy
 
 ```bash
-npx wrangler deploy
+npm run deploy
 ```
 
 Wrangler prints the Worker URL, for example:
@@ -156,7 +158,7 @@ For automation that only needs GitHub state and wants to avoid an external route
 - `notification_status: "none"`: no Discord/Telegram alert was needed, or no alert channel is configured.
 - `notification_status: "deferred"` / `notifications_deferred: true`: Discord or Telegram delivery is running after the response through Cloudflare `waitUntil`; check Worker logs if an alert does not arrive.
 - `notification_status: "failed"`: notification delivery was attempted synchronously and `notification_errors` contains the delivery error.
-- `history_deferred: true`: KV history/quota incident writes were queued through Cloudflare `waitUntil`, so the dashboard response did not wait for storage writes.
+- `history_deferred: true`: KV history writes were queued through Cloudflare `waitUntil`, so the dashboard response did not wait for the history append. Quota incident state is recorded before the response when KV is available so quota-survival decisions are immediately visible.
 - `401`: Wrong wake secret, or GitHub rejected the stored token. Check the JSON `error`, `reason`, or `token_warning` field to tell which side rejected the request.
 - `402`: GitHub quota or billing blocked the start. If the option is available, mark the Codespace as **Keep codespace**, wait for quota reset or adjust GitHub billing settings, then start the same Codespace again. Org-owned or policy-managed Codespaces may have retention rules that override or hide this option.
 - `403`: GitHub token was accepted but cannot access Codespaces, commonly because the `codespace` scope is missing. The response reason may be `github_token_scope_missing`.

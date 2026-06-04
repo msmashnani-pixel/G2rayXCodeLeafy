@@ -328,10 +328,10 @@ run_gh() {
         [[ -n "$shared_token" ]] && token_env=(GH_TOKEN="$shared_token")
     fi
     if command -v timeout >/dev/null 2>&1; then
-        env "${token_env[@]}" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 \
+        env "${token_env[@]}" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 \
             timeout "${G2RAY_GH_TIMEOUT_SEC:-10}" gh "$@"
     else
-        env "${token_env[@]}" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 gh "$@"
+        env "${token_env[@]}" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 gh "$@"
     fi
 }
 

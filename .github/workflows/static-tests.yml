@@ -25,6 +25,17 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js for Worker tooling
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/codespace-waker/package-lock.json
+
+      - name: Install Worker dependencies
+        working-directory: worker/codespace-waker
+        run: npm ci
+
       - name: Syntax check panel
         run: |
           bash -n ./g2ray.sh
@@ -33,7 +44,8 @@ jobs:
           bash -n ./tests/g2ray_behavior_tests.sh
 
       - name: Syntax check Worker
-        run: node --check ./worker/codespace-waker/src/index.js
+        working-directory: worker/codespace-waker
+        run: npm run check
 
       - name: Run static regression tests
         run: bash ./tests/g2ray_static_tests.sh
@@ -42,7 +54,8 @@ jobs:
         run: bash ./tests/g2ray_behavior_tests.sh
 
       - name: Run Worker behavior tests
-        run: node ./tests/worker_behavior_tests.mjs
+        working-directory: worker/codespace-waker
+        run: npm test
 
       - name: Run deterministic benchmark budgets
         run: bash ./g2ray.sh bench --json --mock
@@ -57,6 +70,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js for Worker tooling
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/codespace-waker/package-lock.json
+
       - name: ShellCheck critical issues
         run: |
           sudo apt-get update
@@ -64,4 +84,8 @@ jobs:
           shellcheck -S error ./g2ray.sh ./scripts/post-start.sh ./tests/*.sh
 
       - name: Wrangler dry-run bundle check
-        run: npx --yes wrangler@4 deploy worker/codespace-waker/src/index.js --name g2ray-codespace-waker-ci --compatibility-date 2024-11-01 --dry-run --outdir /tmp/g2ray-worker-dry-run
+        working-directory: worker/codespace-waker
+        run: |
+          npm ci
+          cp wrangler.toml.example wrangler.toml
+          npm run dry-run

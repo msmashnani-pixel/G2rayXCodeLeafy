@@ -18,15 +18,23 @@ function makeRequest(path, secret = "secret") {
 
 function makeKv() {
   const store = new Map();
+  const putOptions = new Map();
   return {
     async get(key) {
       return store.get(key) || null;
     },
-    async put(key, value) {
+    async put(key, value, options = undefined) {
       store.set(key, value);
+      putOptions.set(key, options || null);
     },
     dump() {
       return Object.fromEntries(store.entries());
+    },
+    putOptions(key) {
+      return putOptions.get(key) || null;
+    },
+    dumpPutOptions() {
+      return Object.fromEntries(putOptions.entries());
     }
   };
 }
@@ -56,6 +64,7 @@ async function testFailedSecretRateLimit() {
   assert.equal(last.headers.get("retry-after"), "600");
   assert.equal(body.reason, "worker_wake_secret_rate_limited");
   assert.equal(body.retry_after_seconds, 600);
+  assert.equal(env.WAKER_KV.putOptions("failed-auth:unknown").expirationTtl, 600);
   console.log("PASS: Worker rate-limits repeated bad wake secrets");
 }
 
@@ -252,6 +261,7 @@ async function testAuthorizedWakeCooldownIsOptional() {
   assert.equal(second.headers.get("retry-after"), "60");
   assert.equal(secondBody.reason, "wake_recently_succeeded");
   assert.equal(secondBody.retry_after_seconds, 60);
+  assert.equal(env.WAKER_KV.putOptions("successful-wake:behavior-space").expirationTtl, 60);
   assert.equal(routeCalls >= 2, true);
   console.log("PASS: Worker optional wake cooldown prevents repeated successful wake spam");
 }
@@ -332,6 +342,7 @@ async function testGithubStartRetriesTransientServerFailure() {
 }
 
 async function testQuotaBlockIncludesSurvivalFields() {
+  const kv = makeKv();
   let statusCalls = 0;
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -360,13 +371,14 @@ async function testQuotaBlockIncludesSurvivalFields() {
 
   const response = await worker.fetch(
     makeRequest("/api/wake"),
-    baseEnv({ TEST_NOW_UTC: "2026-06-15T12:00:00Z" }),
+    baseEnv({ WAKER_KV: kv, TEST_NOW_UTC: "2026-06-15T12:00:00Z" }),
     {}
   );
   const body = await responseJson(response);
   assert.equal(response.status, 402);
   assert.equal(body.reason, "quota_or_billing_blocked");
   assert.equal(body.quota_blocked, true);
+  assert.equal(body.route_checked, false);
   assert.equal(body.route_ready, false);
   assert.equal(body.quota_reset_estimate_utc, "2026-07-01T00:00:00Z");
   assert.equal(body.retention_period_minutes, 43200);
@@ -374,6 +386,9 @@ async function testQuotaBlockIncludesSurvivalFields() {
   assert.equal(body.retention_risk, "warning");
   assert.match(body.survival_next_action, /Keep codespace/);
   assert.equal(statusCalls, 1);
+  const history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
+  assert.equal(history.history[0].route_checked, false);
+  assert.equal(history.history[0].route_ready, null);
   console.log("PASS: Worker quota blocks include survival fields");
 }
 
@@ -542,6 +557,47 @@ async function testQuotaIncidentKeepsResetEstimateDuringActiveDroughtHealthCheck
   assert.equal(history.quota_incident.quota_drought_active, true);
   assert.equal(history.quota_incident.quota_reset_estimate_utc, "2026-07-01T00:00:00Z");
   console.log("PASS: Worker preserves active quota incident reset estimate across cheap health checks");
+}
+
+async function testQuotaIncidentRouteReadyHealthBeforeResetDoesNotClearDrought() {
+  const kv = makeKv();
+  await kv.put("quota-incident:behavior-space", JSON.stringify({
+    codespace: "behavior-space",
+    quota_drought_active: true,
+    first_quota_blocked_at: "2026-06-15T12:00:00.000Z",
+    latest_quota_blocked_at: "2026-06-15T12:00:00.000Z",
+    quota_reset_estimate_utc: "2026-07-01T00:00:00Z"
+  }));
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        retention_period_minutes: 43200,
+        last_used_at: "2026-06-20T00:00:00Z"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = baseEnv({ WAKER_KV: kv, TEST_NOW_UTC: "2026-06-20T00:00:00Z" });
+  const response = await worker.fetch(makeRequest("/api/health"), env, {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.route_ready, true);
+  assert.equal(body.quota_drought_active, true);
+  const history = await responseJson(await worker.fetch(makeRequest("/api/history"), env, {}));
+  assert.equal(history.quota_incident.quota_drought_active, true);
+  assert.equal(history.quota_incident.quota_reset_estimate_utc, "2026-07-01T00:00:00Z");
+  console.log("PASS: Worker keeps active quota drought through pre-reset route-ready health checks");
 }
 
 async function testHistoryWorksWithoutGithubToken() {
@@ -970,7 +1026,9 @@ async function testDashboardIncludesRouteHistorySummaryUi() {
   assert.match(html, /quotaReset/);
   assert.match(html, /latencyTrend/);
   assert.match(html, /renderHistorySummary/);
+  assert.match(html, /historySummary\.innerHTML = "";/);
   assert.match(html, /History request failed:/);
+  assert.match(html, /event\.route_checked === true/);
   console.log("PASS: Worker dashboard includes route history summary UI");
 }
 
@@ -1408,6 +1466,7 @@ try {
   await testMonthlyResetEstimateCrossesYear();
   await testKvQuotaIncidentHistoryRecordsBlockedAndRecovery();
   await testQuotaIncidentKeepsResetEstimateDuringActiveDroughtHealthChecks();
+  await testQuotaIncidentRouteReadyHealthBeforeResetDoesNotClearDrought();
   await testHistoryWorksWithoutGithubToken();
   await testScheduledQuotaCronIsDisabledAndThrottledBeforeReset();
   await testScheduledQuotaCronAttemptsOneNearResetWake();

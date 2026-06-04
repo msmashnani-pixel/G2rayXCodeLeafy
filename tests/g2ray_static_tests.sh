@@ -435,6 +435,9 @@ test_runtime_control_paths_are_hardened() {
         || fail 'headless gh calls do not load the shared Codespaces token'
     grep_fixed 'env "${token_env[@]}" GH_PROMPT_DISABLED=1' "$SCRIPT" \
         || fail 'run_gh does not pass the shared Codespaces token into gh safely'
+    if grep_fixed 'GH_FORCE_TTY=0' "$SCRIPT"; then
+        fail 'run_gh sets GH_FORCE_TTY=0, but any GH_FORCE_TTY value forces terminal output'
+    fi
     grep_fixed 'xray_listener_ready()' "$SCRIPT" \
         || fail 'engine readiness does not verify the Xray/XHTTP listener, only an open port'
     grep_fixed 'while ! xray_listener_ready && (( i < 15 )); do' "$SCRIPT" \
@@ -630,6 +633,14 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker local environment-specific .env secrets are not ignored'
     grep_fixed 'worker/codespace-waker/wrangler.toml' "$GITIGNORE" \
         || fail 'Worker local wrangler config is not ignored'
+    grep_fixed 'worker/codespace-waker/node_modules/' "$GITIGNORE" \
+        || fail 'Worker local node_modules are not ignored'
+    grep_fixed 'worker/codespace-waker/.wrangler/' "$GITIGNORE" \
+        || fail 'Worker local Wrangler cache is not ignored'
+    [[ -f "$WORKER_DIR/package-lock.json" ]] \
+        || fail 'Worker npm lockfile is missing, so Wrangler installs can drift'
+    grep_fixed '"wrangler": "4.97.0"' "$WORKER_DIR/package.json" \
+        || fail 'Worker package.json does not pin Wrangler'
     grep_fixed 'env.GITHUB_TOKEN' "$WORKER_SCRIPT" \
         || fail 'Worker does not read GitHub token from Cloudflare secret env'
     grep_fixed 'env.WAKE_SECRET' "$WORKER_SCRIPT" \
@@ -1253,6 +1264,8 @@ test_docs_cover_panel_waker_setup() {
         || fail 'Worker README does not document stable next-action codes'
     grep_fixed 'history_deferred: true' "$WORKER_README" \
         || fail 'Worker README does not document deferred KV history writes'
+    grep_fixed 'Quota incident state is recorded before the response' "$WORKER_README" \
+        || fail 'Worker README overstates quota incident writes as deferred'
     grep_fixed 'Do not paste the GitHub token into G2ray' "$WORKER_README" \
         || fail 'Worker README does not mirror the token handling warning'
     grep_fixed 'read -rsp "Wake secret: " WAKE_SECRET' "$README" \
@@ -1426,16 +1439,24 @@ test_ci_runs_static_regressions() {
         || fail 'CI workflow does not syntax-check g2ray.sh'
     grep_fixed 'shellcheck -S error' "$CI_WORKFLOW" \
         || fail 'CI workflow does not run ShellCheck for critical shell issues'
-    grep_fixed 'node --check ./worker/codespace-waker/src/index.js' "$CI_WORKFLOW" \
+    grep_fixed 'node-version: 22' "$CI_WORKFLOW" \
+        || fail 'CI does not pin Node 22 for current Wrangler'
+    grep_fixed 'npm ci' "$CI_WORKFLOW" \
+        || fail 'CI does not install pinned Worker dependencies'
+    grep_fixed 'npm run check' "$CI_WORKFLOW" \
         || fail 'CI workflow does not syntax-check the Worker script'
-    grep_fixed 'wrangler@4 deploy worker/codespace-waker/src/index.js' "$CI_WORKFLOW" \
-        || fail 'CI workflow does not dry-run bundle the Worker with Wrangler'
+    grep_fixed 'npm test' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not run Worker behavior tests through package scripts'
+    grep_fixed 'cp wrangler.toml.example wrangler.toml' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not dry-run the shipped Wrangler config'
+    grep_fixed 'npm run dry-run' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not dry-run bundle the Worker with pinned Wrangler'
     grep_fixed 'bash ./tests/g2ray_static_tests.sh' "$CI_WORKFLOW" \
         || fail 'CI workflow does not run the static regression suite'
     grep_fixed 'bash ./tests/g2ray_behavior_tests.sh' "$CI_WORKFLOW" \
         || fail 'CI workflow does not run the behavior regression suite'
-    grep_fixed 'node ./tests/worker_behavior_tests.mjs' "$CI_WORKFLOW" \
-        || fail 'CI workflow does not run the Worker behavior suite'
+    grep_fixed 'working-directory: worker/codespace-waker' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not run Worker package scripts from the Worker directory'
     grep_fixed 'LC_ALL: C.UTF-8' "$CI_WORKFLOW" \
         || fail 'CI workflow does not pin a UTF-8 locale for README/static text checks'
     grep_fixed 'permissions:' "$CI_WORKFLOW" \
@@ -1604,8 +1625,10 @@ test_devcontainer_tooling_is_not_duplicated() {
         || fail 'Dockerfile does not install dnsutils for dig-based DNS resolution'
     grep_fixed 'python-is-python3' "$ROOT_DIR/.devcontainer/Dockerfile" \
         || fail 'Dockerfile does not provide python for the in-Codespace behavior test suite'
-    grep_fixed 'nodejs npm' "$ROOT_DIR/.devcontainer/Dockerfile" \
-        || fail 'Dockerfile does not provide Node/npm for Worker checks inside Codespace'
+    grep_fixed 'node_22.x' "$ROOT_DIR/.devcontainer/Dockerfile" \
+        || fail 'Dockerfile does not configure the Node 22 repository for Worker checks inside Codespace'
+    grep_fixed 'apt-get update && apt-get install -y --no-install-recommends nodejs' "$ROOT_DIR/.devcontainer/Dockerfile" \
+        || fail 'Dockerfile does not install NodeSource nodejs, which includes npm'
     if grep_fixed 'vnstat' "$ROOT_DIR/.devcontainer/Dockerfile"; then
         fail 'Dockerfile still installs unused vnstat'
     fi
@@ -1623,9 +1646,14 @@ test_devcontainer_tooling_is_not_duplicated() {
         || fail 'README does not document remote Codespace SSH access'
     grep_fixed 'socks5://127.0.0.1:10808' "$README" \
         || fail 'README does not document the working proxy scheme for gh codespace ssh/rebuild'
+    if grep_fixed '/workspaces/G2rayXCodeLeafy' "$README"; then
+        fail 'README hard-codes the workspace folder and breaks renamed forks'
+    fi
     if grep_fixed 'socks5h://127.0.0.1:10808' "$README"; then
         fail 'README still documents socks5h for gh codespace ssh/rebuild, which breaks Codespaces tunnel RPC on this setup'
     fi
+    grep_fixed 'node_22.x' "$ROOT_DIR/.devcontainer/Dockerfile" \
+        || fail 'devcontainer does not install Node 22 for current Wrangler'
     grep_fixed '.devcontainer/Dockerfile text eol=lf' "$ROOT_DIR/.gitattributes" \
         || fail 'Dockerfile line endings are not pinned to LF'
     grep_fixed 'assets/message.txt text eol=lf' "$ROOT_DIR/.gitattributes" \

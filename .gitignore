@@ -12,6 +12,9 @@
 /.env
 /.env.*
 /.dev.vars*
+/node_modules/
+/worker/codespace-waker/node_modules/
+/worker/codespace-waker/.wrangler/
 /worker/codespace-waker/.dev.vars*
 /worker/codespace-waker/.env
 /worker/codespace-waker/.env.*
