@@ -310,13 +310,28 @@ rotate_log_file() {
     chmod 600 "$file" 2>/dev/null || true
 }
 
+codespace_shared_github_token() {
+    local n key="GITHUB_TOKEN"
+    [[ -r "$CODESPACE_SHARED_ENV_FILE" ]] || return 1
+    n=$(awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$CODESPACE_SHARED_ENV_FILE" 2>/dev/null)
+    n="${n%\"}"; n="${n#\"}"
+    n="${n%\'}"; n="${n#\'}"
+    [[ -n "$n" ]] || return 1
+    printf '%s' "$n"
+}
+
 run_gh() {
     command -v gh >/dev/null 2>&1 || return 127
+    local token_env=() shared_token=""
+    if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
+        shared_token=$(codespace_shared_github_token 2>/dev/null || true)
+        [[ -n "$shared_token" ]] && token_env=(GH_TOKEN="$shared_token")
+    fi
     if command -v timeout >/dev/null 2>&1; then
-        GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 \
+        env "${token_env[@]}" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 \
             timeout "${G2RAY_GH_TIMEOUT_SEC:-10}" gh "$@"
     else
-        GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 gh "$@"
+        env "${token_env[@]}" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 gh "$@"
     fi
 }
 

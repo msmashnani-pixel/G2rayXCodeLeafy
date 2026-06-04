@@ -431,6 +431,10 @@ test_runtime_control_paths_are_hardened() {
         || fail 'headless Codespace detection does not read the shared Codespaces environment file'
     grep_fixed 'detect_codespace_name_from_waker_metadata' "$SCRIPT" \
         || fail 'headless Codespace detection does not fall back to saved local metadata'
+    grep_fixed 'codespace_shared_github_token' "$SCRIPT" \
+        || fail 'headless gh calls do not load the shared Codespaces token'
+    grep_fixed 'env "${token_env[@]}" GH_PROMPT_DISABLED=1' "$SCRIPT" \
+        || fail 'run_gh does not pass the shared Codespaces token into gh safely'
     grep_fixed 'xray_listener_ready()' "$SCRIPT" \
         || fail 'engine readiness does not verify the Xray/XHTTP listener, only an open port'
     grep_fixed 'while ! xray_listener_ready && (( i < 15 )); do' "$SCRIPT" \

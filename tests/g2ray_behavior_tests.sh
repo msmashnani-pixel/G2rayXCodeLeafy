@@ -72,6 +72,7 @@ export G2RAY_SOURCE_ONLY=1
 export G2RAY_DATA_DIR="$TMP_ROOT/bootstrap-data"
 export G2RAY_LOG_DIR="$TMP_ROOT/bootstrap-logs"
 source "$SCRIPT"
+ORIGINAL_RUN_GH="$(declare -f run_gh)"
 reset_runtime_paths
 
 test_port_visibility_is_throttled() {
@@ -137,6 +138,30 @@ test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated() {
             || fail "headless detection used '$detected' instead of local waker metadata"
     )
     pass "codespace detection uses local metadata when gh is unauthenticated"
+}
+
+test_run_gh_uses_shared_codespaces_token_when_shell_is_unauthenticated() {
+    (
+        reset_runtime_paths
+        eval "$ORIGINAL_RUN_GH"
+        unset GH_TOKEN GITHUB_TOKEN
+        CODESPACE_SHARED_ENV_FILE="$TMP_ROOT/shared.env"
+        printf 'GITHUB_TOKEN=shared-token-for-test\n' > "$CODESPACE_SHARED_ENV_FILE"
+        cat > "$TMP_ROOT/bin/gh" <<'SH'
+#!/usr/bin/env bash
+if [[ "${GH_TOKEN:-}" != "shared-token-for-test" ]]; then
+    echo "missing shared GH_TOKEN" >&2
+    exit 31
+fi
+printf 'ok\n'
+SH
+        chmod +x "$TMP_ROOT/bin/gh"
+        local output
+        output="$(run_gh codespace ports -c behavior-space)" \
+            || fail "run_gh did not use the shared Codespaces token when shell auth was missing"
+        [[ "$output" == "ok" ]] || fail "run_gh returned unexpected output: $output"
+    )
+    pass "run_gh uses shared Codespaces token when shell is unauthenticated"
 }
 
 test_runtime_lock_serializes_operations_and_allows_reentry() {
@@ -1389,6 +1414,7 @@ test_support_bundle_marks_unreadable_optional_logs() {
 test_port_visibility_is_throttled
 test_codespace_detection_uses_shared_environment_in_headless_ssh
 test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
+test_run_gh_uses_shared_codespaces_token_when_shell_is_unauthenticated
 test_runtime_lock_serializes_operations_and_allows_reentry
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_cached_route_order_uses_reliability_then_average_latency
