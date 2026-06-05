@@ -7,7 +7,7 @@ LABEL maintainer="G2rayXCodeLeafy" \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash curl wget unzip ca-certificates sudo openssl uuid-runtime tmux tzdata \
-        qrencode jq bc net-tools libcap2-bin iproute2 dnsutils \
+        qrencode jq bc shellcheck net-tools libcap2-bin iproute2 dnsutils \
         python3 python-is-python3 gnupg \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \

@@ -1633,6 +1633,8 @@ test_devcontainer_tooling_is_not_duplicated() {
         || fail 'Dockerfile does not configure the Node 22 repository for Worker checks inside Codespace'
     grep_fixed 'apt-get update && apt-get install -y --no-install-recommends nodejs' "$ROOT_DIR/.devcontainer/Dockerfile" \
         || fail 'Dockerfile does not install NodeSource nodejs, which includes npm'
+    grep_fixed 'shellcheck' "$ROOT_DIR/.devcontainer/Dockerfile" \
+        || fail 'Dockerfile does not install shellcheck for local Bash linting'
     if grep_fixed 'vnstat' "$ROOT_DIR/.devcontainer/Dockerfile"; then
         fail 'Dockerfile still installs unused vnstat'
     fi
