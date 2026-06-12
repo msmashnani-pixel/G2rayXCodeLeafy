@@ -246,6 +246,24 @@ support_include_network_enabled() {
     esac
 }
 
+tcp_fast_open_outbound_enabled() {
+    # TCP Fast Open on the freedom (direct) outbound lets Codespace->origin
+    # connections skip a round-trip on setup. It applies ONLY to outbound dials
+    # to destination sites, never to the inbound XHTTP tunnel from GitHub's edge.
+    # Default "auto" enables it only when the kernel advertises client TFO
+    # support (net.ipv4.tcp_fastopen bit 0x1); on a kernel without it we leave it
+    # off so a setsockopt failure can never break outbound dialing.
+    local override value
+    override=$(printf '%s' "${G2RAY_TCP_FAST_OPEN:-auto}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$override" in
+        0|false|no|off|disabled) return 1 ;;
+        1|true|yes|on|enabled) return 0 ;;
+    esac
+    value=$(cat /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || printf '0')
+    [[ "$value" =~ ^[0-9]+$ ]] || value=0
+    (( (value & 1) == 1 ))
+}
+
 log_structured_event() {
     local ts="$1" level="$2" msg="$3" event
     event=$(printf '%s' "$msg" | awk '{print $1; exit}' | tr -cd 'A-Za-z0-9_.:-')
@@ -2401,8 +2419,13 @@ generate_config() {
     loglevel="${loglevel:-warning}"
     sniff_dest='["http", "tls"]'
     [[ "$sniff_quic" == "true" ]] && sniff_dest='["http", "tls", "quic"]'
+    local direct_sockopt="" tfo_state="off"
+    if tcp_fast_open_outbound_enabled; then
+        direct_sockopt=', "streamSettings": { "sockopt": { "tcpFastOpen": true } }'
+        tfo_state="on"
+    fi
     local uuid_hash; uuid_hash=$(fingerprint_secret "$uuid")
-    log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name}"
+    log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name} tcp_fast_open=${tfo_state}"
     cat > "$CONFIG_FILE" << JSONEOF
 {
   "log": { "loglevel": "${loglevel}", "access": "none", "error": "${LOG_DIR}/xray-error.log" },
@@ -2436,7 +2459,7 @@ generate_config() {
     { "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "tag": "api" }
   ],
   "outbounds": [
-    { "tag": "direct", "protocol": "freedom",   "settings": { "domainStrategy": "UseIPv4" } },
+    { "tag": "direct", "protocol": "freedom",   "settings": { "domainStrategy": "UseIPv4" }${direct_sockopt} },
     { "tag": "block",  "protocol": "blackhole",  "settings": { "response": { "type": "http" } } }
   ],
   "routing": {

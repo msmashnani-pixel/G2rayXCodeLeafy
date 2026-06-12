@@ -249,6 +249,22 @@ test_generated_config_uses_resilient_dns_fallback() {
     pass 'generated Xray config uses low-latency resilient DNS and AsIs routing'
 }
 
+test_tcp_fast_open_is_gated_and_outbound_only() {
+    grep_fixed 'tcp_fast_open_outbound_enabled()' "$SCRIPT" \
+        || fail 'script does not provide a kernel-gated TCP Fast Open toggle'
+    grep_fixed 'G2RAY_TCP_FAST_OPEN' "$SCRIPT" \
+        || fail 'TCP Fast Open is not configurable via G2RAY_TCP_FAST_OPEN'
+    grep_fixed '/proc/sys/net/ipv4/tcp_fastopen' "$SCRIPT" \
+        || fail 'TCP Fast Open auto mode does not check kernel client support before enabling'
+    grep_fixed '"sockopt": { "tcpFastOpen": true }' "$SCRIPT" \
+        || fail 'generated config does not apply tcpFastOpen via outbound sockopt'
+    grep_fixed '"settings": { "domainStrategy": "UseIPv4" }${direct_sockopt}' "$SCRIPT" \
+        || fail 'tcpFastOpen sockopt is not attached to the freedom (direct) outbound'
+    grep_fixed 'G2RAY_TCP_FAST_OPEN' "$README" \
+        || fail 'README does not document the TCP Fast Open toggle'
+    pass 'TCP Fast Open is kernel-gated and applied only to the direct outbound'
+}
+
 test_generated_links_include_domain_and_ip_variants() {
     grep_fixed 'resolve_domain_ip()' "$SCRIPT" \
         || fail 'script does not provide a resolver for the Codespaces app domain'
@@ -1738,6 +1754,7 @@ test_shell_files_are_lf_normalized
 test_panel_script_is_executable
 test_xray_version_can_be_pinned
 test_generated_config_uses_resilient_dns_fallback
+test_tcp_fast_open_is_gated_and_outbound_only
 test_generated_links_include_domain_and_ip_variants
 test_terminal_branding_is_customized_red
 test_runtime_diagnostics_logging
