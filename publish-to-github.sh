@@ -20,12 +20,15 @@ command -v gh  >/dev/null 2>&1 || { echo "GitHub CLI (gh) is not installed: http
 [ -d .git ] || { git init >/dev/null; git branch -M main; }
 
 # --- Log in to GitHub ---
-if ! gh auth status >/dev/null 2>&1; then
+# Probe with an API call, not `gh auth status`: status returns nonzero when any
+# stored account has an expired token, even if the active account is fine.
+user=$(gh api user --jq .login 2>/dev/null || true)
+if [ -z "$user" ]; then
     echo "Opening GitHub login..."
     gh auth login
+    user=$(gh api user --jq .login 2>/dev/null || true)
+    [ -n "$user" ] || { echo "Could not read your GitHub username."; exit 1; }
 fi
-user=$(gh api user --jq .login)
-[ -n "$user" ] || { echo "Could not read your GitHub username."; exit 1; }
 echo "Logged in as: $user"
 read -rp "Publish to this account? Press Enter to accept, or type 'switch' to use another account: " ans
 if [ "$ans" = "switch" ]; then

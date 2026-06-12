@@ -11,7 +11,11 @@
     Just double-click publish-to-github.cmd (which calls this script).
 #>
 
-$ErrorActionPreference = 'Stop'
+# git and gh write normal progress to stderr. Under Windows PowerShell 5.1,
+# $ErrorActionPreference='Stop' would turn that stderr into a fatal
+# NativeCommandError (even on success), so we keep 'Continue' and check
+# $LASTEXITCODE explicitly after every command that matters.
+$ErrorActionPreference = 'Continue'
 Set-Location -LiteralPath $PSScriptRoot
 
 function Fail($msg) {
@@ -36,21 +40,25 @@ if (-not (Test-Path (Join-Path $PSScriptRoot '.git'))) {
 }
 
 # --- Log in to GitHub (opens your browser if you are not already signed in) ---
-gh auth status 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) {
+# Probe with an API call, NOT `gh auth status`: status returns nonzero when ANY
+# stored account has an expired token, even if the active account is perfectly
+# fine. `gh api user` reflects only the active account.
+$user = (gh api user --jq .login 2>$null)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($user)) {
     Write-Host "Opening GitHub login in your browser..." -ForegroundColor Yellow
     gh auth login
     if ($LASTEXITCODE -ne 0) { Fail "GitHub login did not complete." }
+    $user = (gh api user --jq .login 2>$null)
+    if ([string]::IsNullOrWhiteSpace($user)) { Fail "Could not read your GitHub username after login." }
 }
-$user = (gh api user --jq .login 2>$null)
-if (-not $user) { Fail "Could not read your GitHub username after login." }
 $user = $user.Trim()
 Write-Host "Logged in as: $user" -ForegroundColor Green
 $ans = Read-Host "Publish to this account? Press Enter to accept, or type 'switch' to log into a different account"
 if ($ans -eq 'switch') {
     gh auth login
+    if ($LASTEXITCODE -ne 0) { Fail "GitHub login did not complete." }
     $user = (gh api user --jq .login 2>$null)
-    if (-not $user) { Fail "Could not read your GitHub username after switching." }
+    if ([string]::IsNullOrWhiteSpace($user)) { Fail "Could not read your GitHub username after switching." }
     $user = $user.Trim()
     Write-Host "Now logged in as: $user" -ForegroundColor Green
 }
