@@ -226,16 +226,15 @@ test_generated_config_uses_resilient_dns_fallback() {
         || fail 'generated Xray DNS config does not explicitly keep fallback enabled'
     grep_fixed '"disableFallbackIfMatch": false' "$SCRIPT" \
         || fail 'generated Xray DNS config could stop fallback after a matched resolver times out'
-    grep_fixed '"https+local://1.1.1.1/dns-query"' "$SCRIPT" \
-        || fail 'generated Xray DNS config does not use local-mode Cloudflare DoH'
-    grep_fixed '"https+local://dns.google/dns-query"' "$SCRIPT" \
-        || fail 'generated Xray DNS config does not include Google DoH fallback'
-    grep_fixed '"address": "1.0.0.1"' "$SCRIPT" \
-        || fail 'generated Xray DNS config does not include Cloudflare UDP fallback'
-    grep_fixed '"address": "8.8.4.4"' "$SCRIPT" \
-        || fail 'generated Xray DNS config does not include Google UDP fallback'
-    grep_fixed '"timeoutMs": 2500' "$SCRIPT" \
-        || fail 'generated Xray DNS config does not bound DoH resolver wait time'
+    grep_fixed '"servers": ["localhost", "1.1.1.1", "1.0.0.1", "8.8.8.8"]' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not use low-latency local-first UDP resolvers'
+    grep_fixed '"queryStrategy": "UseIPv4"' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not force IPv4 to avoid broken-AAAA latency'
+    if grep_fixed 'https+local://' "$SCRIPT"; then
+        fail 'generated Xray DNS config still pays a DoH TLS round-trip per resolver instead of fast UDP/local lookups'
+    fi
+    grep_fixed '"domainStrategy": "AsIs"' "$SCRIPT" \
+        || fail 'routing still forces a per-connection DNS lookup; use AsIs to cut connection latency'
     grep_fixed 'upgrade_config_dns()' "$SCRIPT" \
         || fail 'script does not provide an in-place DNS migration for existing configs'
     grep_fixed '.dns = {' "$SCRIPT" \
@@ -247,7 +246,7 @@ test_generated_config_uses_resilient_dns_fallback() {
     if grep_fixed '"domains": ["geosite:geolocation-!cn"]' "$SCRIPT"; then
         fail 'generated Xray DNS config still pins most lookups to a single domain-matched resolver before fallback'
     fi
-    pass 'generated Xray config uses resilient DNS fallback'
+    pass 'generated Xray config uses low-latency resilient DNS and AsIs routing'
 }
 
 test_generated_links_include_domain_and_ip_variants() {
@@ -1426,21 +1425,21 @@ test_logs_are_bounded_and_quota_is_cycle_aware() {
 test_fallback_link_count_is_capped() {
     grep_fixed 'MAX_FALLBACK_LINKS=' "$SCRIPT" \
         || fail 'fallback link cap is not configurable'
-    grep_fixed 'MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-20}"' "$SCRIPT" \
-        || fail 'fallback link default is not 20 exported IP routes'
-    grep_fixed 'ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-24}"' "$SCRIPT" \
-        || fail 'route monitor default does not scan enough candidates for 20 exports'
-    grep_fixed '(( max > 32 )) && max=32' "$SCRIPT" \
-        || fail 'route monitor hard cap is not bounded at 32 candidates'
+    grep_fixed 'MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-30}"' "$SCRIPT" \
+        || fail 'fallback link default is not 30 exported IP routes'
+    grep_fixed 'ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-40}"' "$SCRIPT" \
+        || fail 'route monitor default does not scan enough candidates for 30 exports'
+    grep_fixed '(( max > 64 )) && max=64' "$SCRIPT" \
+        || fail 'route monitor hard cap is not bounded at 64 candidates'
     grep_fixed '(( index > max_links )) && break' "$SCRIPT" \
         || fail 'fallback link generation does not cap weak extra routes'
     grep_fixed 'G2RAY_MAX_FALLBACK_LINKS' "$README" \
         || fail 'README does not document the fallback link cap'
     grep_fixed 'G2RAY_DNS_CACHE_TTL_SEC' "$README" \
         || fail 'README does not document the DNS candidate cache TTL'
-    grep_fixed 'Default: `20`' "$README" \
-        || fail 'README does not document 20 exported fallback links by default'
-    grep_fixed 'Default: `24`, hard-capped at `32`' "$README" \
+    grep_fixed 'Default: `30`' "$README" \
+        || fail 'README does not document 30 exported fallback links by default'
+    grep_fixed 'Default: `40`, hard-capped at `64`' "$README" \
         || fail 'README does not document the widened bounded route scanner default'
     pass 'fallback link count is capped and documented'
 }

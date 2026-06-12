@@ -98,8 +98,8 @@ XRAY_PORT="${XRAY_PORT:-443}"
 [[ "$XRAY_PORT" =~ ^[0-9]+$ && "$XRAY_PORT" -gt 0 && "$XRAY_PORT" -le 65535 ]] || XRAY_PORT=443
 CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.69.79.91 20.85.77.48 20.120.56.11 20.125.70.28 20.90.66.7 20.103.221.187 20.207.70.99}"
-MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-20}"
-ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-24}"
+MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-30}"
+ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-40}"
 DIAGNOSTIC_MAX_FALLBACK_PROBES="${G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES:-12}"
 SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
@@ -110,7 +110,7 @@ ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
 DNS_CACHE_TTL_SEC="${G2RAY_DNS_CACHE_TTL_SEC:-300}"
 ROUTE_FAILURE_COOLDOWN_SEC="${G2RAY_ROUTE_FAILURE_COOLDOWN_SEC:-180}"
-ROUTE_PROBE_CONCURRENCY="${G2RAY_ROUTE_PROBE_CONCURRENCY:-4}"
+ROUTE_PROBE_CONCURRENCY="${G2RAY_ROUTE_PROBE_CONCURRENCY:-6}"
 ROUTE_PROBE_JITTER_SEC="${G2RAY_ROUTE_PROBE_JITTER_SEC:-0}"
 PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
 LAST_GOOD_ROUTE_MAX_AGE_SEC="${G2RAY_LAST_GOOD_ROUTE_MAX_AGE_SEC:-1800}"
@@ -124,8 +124,8 @@ LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$ROUTE_READY_STABLE_PROBES" =~ ^[0-9]+$ && "$ROUTE_READY_STABLE_PROBES" -ge 1 ]] || ROUTE_READY_STABLE_PROBES=2
 [[ "$ROUTE_READY_STABLE_SLEEP_SEC" =~ ^[0-9]+$ ]] || ROUTE_READY_STABLE_SLEEP_SEC=1
 [[ "$DNS_CACHE_TTL_SEC" =~ ^[0-9]+$ ]] || DNS_CACHE_TTL_SEC=300
-[[ "$ROUTE_PROBE_CONCURRENCY" =~ ^[0-9]+$ && "$ROUTE_PROBE_CONCURRENCY" -ge 1 ]] || ROUTE_PROBE_CONCURRENCY=4
-(( ROUTE_PROBE_CONCURRENCY > 8 )) && ROUTE_PROBE_CONCURRENCY=8
+[[ "$ROUTE_PROBE_CONCURRENCY" =~ ^[0-9]+$ && "$ROUTE_PROBE_CONCURRENCY" -ge 1 ]] || ROUTE_PROBE_CONCURRENCY=6
+(( ROUTE_PROBE_CONCURRENCY > 16 )) && ROUTE_PROBE_CONCURRENCY=16
 
 umask 077
 mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
@@ -578,6 +578,10 @@ resolve_dns_provider_ips_with_sources() {
     ({ json_dns_ips "https://dns.google/resolve?name=${domain}&type=A" || true; } | awk 'NF {print "dns_google\t" $0}' > "$tmpdir/dns_google") &
     pids+=("$!")
     ({ json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json" || true; } | awk 'NF {print "dns_cloudflare\t" $0}' > "$tmpdir/dns_cloudflare") &
+    pids+=("$!")
+    ({ json_dns_ips "https://dns.quad9.net:5053/dns-query?name=${domain}&type=A" "accept: application/dns-json" || true; } | awk 'NF {print "dns_quad9\t" $0}' > "$tmpdir/dns_quad9") &
+    pids+=("$!")
+    ({ json_dns_ips "https://dns.google/resolve?name=${domain}&type=A&edns_client_subnet=0.0.0.0/0" || true; } | awk 'NF {print "dns_google_ecs\t" $0}' > "$tmpdir/dns_google_ecs") &
     pids+=("$!")
     ({ curl_remote_ip "$domain" || true; } | awk 'NF {print "remote_http\t" $0}' > "$tmpdir/remote_http") &
     pids+=("$!")
@@ -1707,13 +1711,24 @@ save_session_uptime() {
     printf '%s\n' "$now"               > "$SESSION_START_FILE"
 }
 
+# Atomically claim a mkdir-based lock directory, then confirm we still own it.
+# The readback guards against a racing stale-lock breaker that could delete and
+# recreate the directory between our mkdir and our pid write. On any mismatch we
+# report failure so the caller retries instead of two holders running at once.
+_try_claim_lock_dir() {
+    local dir="$1" op="${2:-}" owner
+    mkdir "$dir" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || true
+    [[ -n "$op" ]] && printf '%s\n' "$op" > "$dir/op" 2>/dev/null || true
+    owner=$(cat "$dir/pid" 2>/dev/null || true)
+    [[ "$owner" == "$$" ]]
+}
+
 acquire_runtime_lock() {
-    local op="${1:-runtime}" i lock_pid attempts="$RUNTIME_LOCK_WAIT_ATTEMPTS"
+    local op="${1:-runtime}" i lock_pid recheck attempts="$RUNTIME_LOCK_WAIT_ATTEMPTS"
     [[ "$attempts" =~ ^[0-9]+$ && "$attempts" -ge 1 ]] || attempts=20
     for ((i=1; i<=attempts; i++)); do
-        if mkdir "$RUNTIME_LOCK_DIR" 2>/dev/null; then
-            printf '%s\n' "$$" > "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true
-            printf '%s\n' "$op" > "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
+        if _try_claim_lock_dir "$RUNTIME_LOCK_DIR" "$op"; then
             return 0
         fi
         lock_pid=$(cat "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true)
@@ -1721,30 +1736,23 @@ acquire_runtime_lock() {
             log_event WARN "runtime_lock_stale malformed pid=${lock_pid:-missing} op=${op}"
             rm -f "$RUNTIME_LOCK_DIR/pid" "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
             rmdir "$RUNTIME_LOCK_DIR" 2>/dev/null || true
-            if mkdir "$RUNTIME_LOCK_DIR" 2>/dev/null; then
-                printf '%s\n' "$$" > "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true
-                printf '%s\n' "$op" > "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
-                return 0
-            fi
+            _try_claim_lock_dir "$RUNTIME_LOCK_DIR" "$op" && return 0
             continue
         fi
         if [[ "$lock_pid" == "$$" ]]; then
             rm -f "$RUNTIME_LOCK_DIR/pid" "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
             rmdir "$RUNTIME_LOCK_DIR" 2>/dev/null || true
-            if mkdir "$RUNTIME_LOCK_DIR" 2>/dev/null; then
-                printf '%s\n' "$$" > "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true
-                printf '%s\n' "$op" > "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
-                return 0
-            fi
+            _try_claim_lock_dir "$RUNTIME_LOCK_DIR" "$op" && return 0
             continue
         fi
-        if [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
-            rm -f "$RUNTIME_LOCK_DIR/pid" "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
-            rmdir "$RUNTIME_LOCK_DIR" 2>/dev/null || true
-            if mkdir "$RUNTIME_LOCK_DIR" 2>/dev/null; then
-                printf '%s\n' "$$" > "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true
-                printf '%s\n' "$op" > "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
-                return 0
+        if ! kill -0 "$lock_pid" 2>/dev/null; then
+            # Re-read the pid right before breaking, so we never delete a lock that
+            # a third process legitimately acquired since our liveness check.
+            recheck=$(cat "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true)
+            if [[ "$recheck" == "$lock_pid" ]]; then
+                rm -f "$RUNTIME_LOCK_DIR/pid" "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
+                rmdir "$RUNTIME_LOCK_DIR" 2>/dev/null || true
+                _try_claim_lock_dir "$RUNTIME_LOCK_DIR" "$op" && return 0
             fi
             continue
         fi
@@ -1836,22 +1844,14 @@ upgrade_config_dns() {
     tmp=$(mktemp "${CONFIG_FILE}.dns.XXXXXX") || return 0
     if jq '
       .dns = {
-        "hosts": {
-          "dns.google": ["8.8.8.8", "8.8.4.4"],
-          "cloudflare-dns.com": ["1.1.1.1", "1.0.0.1"]
-        },
-        "servers": [
-          { "address": "https+local://1.1.1.1/dns-query", "queryStrategy": "UseIPv4", "timeoutMs": 2500 },
-          { "address": "https+local://dns.google/dns-query", "queryStrategy": "UseIPv4", "timeoutMs": 2500 },
-          { "address": "1.0.0.1", "queryStrategy": "UseIPv4", "timeoutMs": 2000 },
-          { "address": "8.8.4.4", "queryStrategy": "UseIPv4", "timeoutMs": 2000 },
-          "localhost"
-        ],
+        "servers": ["localhost", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
         "queryStrategy": "UseIPv4",
+        "disableCache": false,
         "disableFallback": false,
         "disableFallbackIfMatch": false,
         "enableParallelQuery": true
       }
+      | (.routing.domainStrategy) = "AsIs"
     ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
         if cmp -s "$CONFIG_FILE" "$tmp"; then
             rm -f "$tmp" 2>/dev/null || true
@@ -2038,10 +2038,9 @@ _background_tasks() {
 }
 
 acquire_bg_tasks_lock() {
-    local i lock_pid
+    local i lock_pid recheck
     for i in {1..20}; do
-        if mkdir "$BG_TASKS_LOCK_DIR" 2>/dev/null; then
-            printf '%s\n' "$$" > "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true
+        if _try_claim_lock_dir "$BG_TASKS_LOCK_DIR"; then
             return 0
         fi
         lock_pid=$(cat "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true)
@@ -2049,15 +2048,15 @@ acquire_bg_tasks_lock() {
             log_event WARN "background_lock_stale malformed pid=${lock_pid:-missing}"
             rm -f "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true
             rmdir "$BG_TASKS_LOCK_DIR" 2>/dev/null || true
-            if mkdir "$BG_TASKS_LOCK_DIR" 2>/dev/null; then
-                printf '%s\n' "$$" > "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true
-                return 0
-            fi
+            _try_claim_lock_dir "$BG_TASKS_LOCK_DIR" && return 0
             continue
         fi
         if ! kill -0 "$lock_pid" 2>/dev/null; then
-            rm -f "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true
-            rmdir "$BG_TASKS_LOCK_DIR" 2>/dev/null || true
+            recheck=$(cat "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true)
+            if [[ "$recheck" == "$lock_pid" ]]; then
+                rm -f "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true
+                rmdir "$BG_TASKS_LOCK_DIR" 2>/dev/null || true
+            fi
             continue
         fi
         sleep 0.1
@@ -2414,18 +2413,9 @@ generate_config() {
     "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true, "handshake": ${handshake}, "connIdle": ${conn_idle}, "uplinkOnly": ${uplink_only}, "downlinkOnly": ${downlink_only}, "bufferSize": ${buffer_size} } }
   },
   "dns": {
-    "hosts": {
-      "dns.google": ["8.8.8.8", "8.8.4.4"],
-      "cloudflare-dns.com": ["1.1.1.1", "1.0.0.1"]
-    },
-    "servers": [
-      { "address": "https+local://1.1.1.1/dns-query", "queryStrategy": "UseIPv4", "timeoutMs": 2500 },
-      { "address": "https+local://dns.google/dns-query", "queryStrategy": "UseIPv4", "timeoutMs": 2500 },
-      { "address": "1.0.0.1", "queryStrategy": "UseIPv4", "timeoutMs": 2000 },
-      { "address": "8.8.4.4", "queryStrategy": "UseIPv4", "timeoutMs": 2000 },
-      "localhost"
-    ],
+    "servers": ["localhost", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
     "queryStrategy": "UseIPv4",
+    "disableCache": false,
     "disableFallback": false,
     "disableFallbackIfMatch": false,
     "enableParallelQuery": true
@@ -2450,7 +2440,7 @@ generate_config() {
     { "tag": "block",  "protocol": "blackhole",  "settings": { "response": { "type": "http" } } }
   ],
   "routing": {
-    "domainStrategy": "IPIfNonMatch",
+    "domainStrategy": "AsIs",
     "rules": [
       { "inboundTag": ["api"],                                   "outboundTag": "api",    "type": "field" },
       { "type": "field", "ip":       ["geoip:private"],          "outboundTag": "block"  },
@@ -2516,8 +2506,8 @@ generate_domain_link() {
 
 route_monitor_max_candidates() {
     local max="$ROUTE_MONITOR_MAX_CANDIDATES"
-    [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=24
-    (( max > 32 )) && max=32
+    [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=40
+    (( max > 64 )) && max=64
     printf '%s' "$max"
 }
 
@@ -2789,8 +2779,8 @@ refresh_route_candidate_health() {
     local concurrency pids=() files=() active=0 file result probed_count=0
     max=$(route_monitor_max_candidates)
     concurrency="$ROUTE_PROBE_CONCURRENCY"
-    [[ "$concurrency" =~ ^[0-9]+$ && "$concurrency" -gt 0 ]] || concurrency=4
-    (( concurrency > 8 )) && concurrency=8
+    [[ "$concurrency" =~ ^[0-9]+$ && "$concurrency" -gt 0 ]] || concurrency=6
+    (( concurrency > 16 )) && concurrency=16
     candidates=$(resolve_domain_ips_with_sources "$PORT_DOMAIN" || true)
     [[ -n "$candidates" ]] || return 0
     route_health_tmp=$(mktemp "$DATA_DIR/route_health.XXXXXX") || return 1
@@ -2898,6 +2888,7 @@ cached_usable_fallback_ips() {
         | while IFS=$'\t' read -r _pinned _success _avg _latest _last_good ip _code _ms; do
             valid_ipv4 "$ip" || continue
             candidate_blacklisted "$ip" && continue
+            route_candidate_cooldown_active "$ip" && ! route_candidate_cooldown_bypass "$ip" && continue
             printf '%s\n' "$ip"
         done | awk '!seen[$0]++ {print}'
 }
@@ -3274,17 +3265,6 @@ refresh_config_exports() {
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
     ((${#link_array[@]})) || { clear_config_exports "no_exportable_links"; return 1; }
     write_config_exports_from_links "${link_array[@]}"
-}
-
-generate_link() {
-    generate_domain_link
-}
-
-generate_links_for_display() {
-    local uuid; uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
-    [[ -z "$uuid" ]] && { printf ''; return 1; }
-    printf '%s\n' "$(generate_domain_link)"
-    generate_ip_links
 }
 
 log_diagnostic_snapshot() {
@@ -4474,7 +4454,6 @@ while true; do
         13)
             refresh_screen
             echo -e "\n  ${GREEN}● Live Engine Logs${NC}"
-            rotate_log_file "$LOG_DIR/xray-error.log"
             if [[ -s "$LOG_DIR/xray.log" ]]; then
                 echo -e "  ${WHITE}${B}Runtime log${NC}"
                 tail -n 15 "$LOG_DIR/xray.log" | sed 's/^/  /'

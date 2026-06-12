@@ -142,12 +142,12 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_QR_MODE` **(Optional)** — Controls QR display in the config view: `recommended` (default), `all`, or `none`.
 - `G2RAY_EXTRA_FALLBACK_IPS` **(Optional)** — Adds comma-, semicolon-, or space-separated IP fallback candidates before auto-detected ones.
 - `G2RAY_DEFAULT_FALLBACK_IPS` **(Optional)** — Replaces the built-in fallback IP candidate list.
-- `G2RAY_MAX_FALLBACK_LINKS` **(Optional)** — Caps exported usable IP fallback links. Default: `20`.
-- `G2RAY_ROUTE_MONITOR_MAX_CANDIDATES` **(Optional)** — Caps cached candidate route probes shown in diagnostics. Default: `24`, hard-capped at `32`.
+- `G2RAY_MAX_FALLBACK_LINKS` **(Optional)** — Caps exported usable IP fallback links. Default: `30`.
+- `G2RAY_ROUTE_MONITOR_MAX_CANDIDATES` **(Optional)** — Caps cached candidate route probes shown in diagnostics. Default: `40`, hard-capped at `64`.
 - `G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES` **(Optional)** — Caps live fallback route probes in option `14) Diagnostics`. Default: `12`.
 - `G2RAY_ROUTE_HEALTH_TTL_SEC` **(Optional)** — Seconds cached route health can be reused to order exported configs before refreshing. Default: `300`.
 - `G2RAY_DNS_CACHE_TTL_SEC` **(Optional)** — Seconds DNS/provider-discovered route IP candidates stay cached before provider lookups run again. Default: `300`; set `0` to disable this DNS candidate cache.
-- `G2RAY_ROUTE_PROBE_CONCURRENCY` **(Optional)** — Maximum parallel route candidate probes during a route-health refresh. Default: `4`, hard-capped at `8`.
+- `G2RAY_ROUTE_PROBE_CONCURRENCY` **(Optional)** — Maximum parallel route candidate probes during a route-health refresh. Default: `6`, hard-capped at `16`.
 - `G2RAY_ROUTE_FAILURE_COOLDOWN_SEC` **(Optional)** — Seconds to temporarily skip candidates that timed out or returned edge/origin errors. Default: `180`.
 - `G2RAY_EXPORT_REVALIDATE_TOP_CACHED=0` **(Optional)** — Disable the default one-probe revalidation of the top cached route before exporting configs. Leave enabled for better protection against a stale first IP; disable only when you need fastest possible export generation.
 - `G2RAY_LAST_GOOD_ROUTE_MAX_AGE_SEC` **(Optional)** — Seconds a last-good route can break ties in exported config ordering. Default: `1800`; set `0` to disable last-good tie preference.
@@ -260,7 +260,7 @@ bash ./g2ray.sh bench --json --mock
 
 `--support-bundle` creates a redacted `.tar.gz` support bundle under `logs/`. It includes doctor JSON, diagnostics, structured event logs, route health, rolling route stats, route-settling history, and Xray logs while redacting VLESS links, UUIDs, bearer tokens, GitHub tokens, and wake secrets.
 
-`export` refreshes local helper files in the Codespace: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `data/configs-meta.json`. These files are for your own devices and private tests only. The base64 subscription is encoding, not encryption, and generated exports are git-ignored because they contain live credentials.
+`export` refreshes local helper files in the Codespace: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `configs-meta.json`. These files are for your own devices and private tests only. The base64 subscription is encoding, not encryption, and generated exports are git-ignored because they contain live credentials.
 
 Local verification commands:
 
@@ -297,7 +297,7 @@ Option `18) Toggle Low-Overhead Mode` reduces INFO-level app logging and slows l
 
 Option `49) Toggle Latency Focus Mode` is more aggressive than low-overhead mode. It keeps heartbeat, session accounting, and self-heal alive, but suppresses non-error app logs and skips noncritical background route/export/message refreshes while the mode is active. Use it briefly while measuring client latency; turn it off before collecting support logs or expecting automatic export updates.
 
-The config screen writes three local export helpers: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `data/configs-meta.json`. They are ignored by git by default because they include live connection credentials or metadata. Use them locally inside the Codespace, or copy them only through a private channel you control. This project intentionally does not publish a raw GitHub subscription URL.
+The config screen writes three local export helpers: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `configs-meta.json`. They are ignored by git by default because they include live connection credentials or metadata. Use them locally inside the Codespace, or copy them only through a private channel you control. This project intentionally does not publish a raw GitHub subscription URL.
 
 Codespaces port `443` is made publicly reachable so your private client config can reach the XHTTP listener through GitHub's app route. Treat every generated VLESS link and local subscription file as a bearer credential: keep them private, regenerate the config if they leak, and do not operate a public/shared access service.
 

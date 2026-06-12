@@ -433,18 +433,18 @@ EOF
 test_route_monitor_default_and_hard_cap_are_wide_but_bounded() {
     reset_runtime_paths
     ROUTE_MONITOR_MAX_CANDIDATES=""
-    [[ "$(route_monitor_max_candidates)" == "24" ]] || fail "empty route monitor max did not default to 24"
+    [[ "$(route_monitor_max_candidates)" == "40" ]] || fail "empty route monitor max did not default to 40"
 
     ROUTE_MONITOR_MAX_CANDIDATES=0
-    [[ "$(route_monitor_max_candidates)" == "24" ]] || fail "zero route monitor max did not default to 24"
+    [[ "$(route_monitor_max_candidates)" == "40" ]] || fail "zero route monitor max did not default to 40"
 
     ROUTE_MONITOR_MAX_CANDIDATES=12
     [[ "$(route_monitor_max_candidates)" == "12" ]] || fail "valid route monitor max was not honored"
 
     ROUTE_MONITOR_MAX_CANDIDATES=99
-    [[ "$(route_monitor_max_candidates)" == "32" ]] || fail "route monitor max was not hard-capped at 32"
+    [[ "$(route_monitor_max_candidates)" == "64" ]] || fail "route monitor max was not hard-capped at 64"
 
-    pass "route monitor scans enough candidates for 20 exports while staying bounded"
+    pass "route monitor scans enough candidates for 30 exports while staying bounded"
 }
 
 test_blacklisted_route_is_excluded_from_cached_exports() {
