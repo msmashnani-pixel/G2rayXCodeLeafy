@@ -16,7 +16,6 @@
     }
   },
   "postStartCommand": "bash ./scripts/post-start.sh",
-  "postAttachCommand": "bash ./g2ray.sh",
   "portsAttributes": {
     "443": {
       "label": "g2ray-vless",
